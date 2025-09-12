@@ -4,6 +4,7 @@ import os
 from geom import gmesh
 from cons import framework, length, bend
 from utils import renderer, parser
+import math
 
 ti.init(arch=ti.cpu)
 
@@ -51,13 +52,14 @@ cons_pos = cons_vert_p.to_numpy()
 cons_pos_init = np.copy(cons_pos)
 
 while tirender.window.running:
+  tirender.handle_input()
   for sub in range(substep):
     # init XPBD solver
     xpbd.make_prediction()
 
     # set fixed points
-    cons_pos[1, 0] = cons_pos_init[1, 0] - np.math.sin(
-        2 * np.math.pi * tirender.time / 5.0)**2 * 0.6
+    cons_pos[1, 0] = cons_pos_init[1, 0] - math.sin(
+        2 * math.pi * tirender.time / 5.0)**2 * 0.6
     cons_vert_p.from_numpy(cons_pos)
     mesh.set_pos_by_index(n=2, index=cons_vert_i, pos=cons_vert_p)
 
@@ -66,5 +68,7 @@ while tirender.window.running:
     for _ in range(solve_iters):
       xpbd.update_cons()
     xpbd.update_vel()
+
+
 
   tirender.render()

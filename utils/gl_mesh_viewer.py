@@ -158,7 +158,9 @@ class Mesh2dShaderProgram:
       """
     return shaders.compileProgram(
         shaders.compileShader(vertex_shader, GL_VERTEX_SHADER),
-        shaders.compileShader(fragment_shader, GL_FRAGMENT_SHADER))
+        shaders.compileShader(fragment_shader, GL_FRAGMENT_SHADER),
+        validate=False
+    )
 
 
 class GL_Mesh2D:
@@ -236,11 +238,18 @@ class MeshObj:
 
 # ! maybe find a method to set which GPU to use
 class OpenGLMeshRenderer2D:
-
   def __init__(self, title: str, res) -> None:
     if not glfw.init():
-      return -1
+      raise RuntimeError('glfw failed')
 
+    glfw.window_hint(glfw.GLFW.GLFW_CONTEXT_VERSION_MAJOR, 3)
+    glfw.window_hint(glfw.GLFW.GLFW_CONTEXT_VERSION_MINOR, 3)
+    glfw.window_hint(glfw.GLFW.GLFW_OPENGL_FORWARD_COMPAT, GL_TRUE)
+    glfw.window_hint(
+      glfw.GLFW.GLFW_OPENGL_PROFILE, glfw.GLFW.GLFW_OPENGL_CORE_PROFILE
+    )
+    glfw.window_hint(glfw.GLFW.GLFW_SAMPLES, 4)
+    # glEnable(GL_MULTISAMPLE)
     self.window = glfw.create_window(res[0], res[1], title, None, None)
     self.res = res
     self.fps_count = 0
@@ -250,24 +259,18 @@ class OpenGLMeshRenderer2D:
     self.dragging_right = False
     self.start_drag_pos = np.zeros(dtype=np.float32, shape=2)
     self.start_drag_pos_right = np.zeros(dtype=np.float32, shape=2)
-    glfw.window_hint(glfw.GLFW.GLFW_CONTEXT_VERSION_MAJOR, 3)
-    glfw.window_hint(glfw.GLFW.GLFW_CONTEXT_VERSION_MINOR, 3)
-    glfw.window_hint(glfw.GLFW.GLFW_OPENGL_PROFILE,
-                     glfw.GLFW.GLFW_OPENGL_CORE_PROFILE)
-    glfw.window_hint(glfw.GLFW.GLFW_SAMPLES, 4)
-    #glEnable(GL_MULTISAMPLE)
 
     if not self.window:
       glfw.terminate()
-      return -1
+      raise RuntimeError('glfw window failed')
 
     # Make the window's context current
     glfw.make_context_current(self.window)
     glfw.swap_interval(1)
     glEnable(GL_BLEND)
     glBlendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA)
-    glEnable(GL_POINT_SMOOTH)
-    glEnable(GL_LINE_SMOOTH)
+    #glEnable(GL_POINT_SMOOTH)
+    #glEnable(GL_LINE_SMOOTH)
 
     glfw.set_input_mode(self.window, glfw.STICKY_KEYS, GL_TRUE)
 
@@ -338,7 +341,7 @@ class OpenGLMeshRenderer2D:
 
   def set_movie_track(self, max_frames, frame_per_track=1):
     if self.frame_count > 0:
-      assert False, 'Error! Movie track mode should be set at the beginning'
+      assert False, "Error! Movie track mode should be set at the beginning"
     self.movie_track_mode = True
     self.movie_track_frames = max_frames
     self.frame_per_track = frame_per_track
@@ -355,31 +358,29 @@ class OpenGLMeshRenderer2D:
   def add_cursor_move_callback(self, func):
     self.cursor_move_callback.append(func)
 
-  def set_mesh(self,
-               verts: np.ndarray,
-               uvs: np.ndarray,
-               faces: np.ndarray,
-               texpath: str,
-               idx=0):
+  def set_mesh(
+      self, verts: np.ndarray, uvs: np.ndarray, faces: np.ndarray, texpath: str, idx=0
+  ):
     self.mesh_objs.append(MeshObj(idx, verts, uvs, faces, texpath))
     self.data_set = True
 
-  def set_wireframe_mode(self,
-                         wireframe: bool,
-                         color: tuple = (0.1, 0.4, 1.0, 0.8),
-                         idx=0):
+  def set_wireframe_mode(
+      self, wireframe: bool, color: tuple = (0.1, 0.4, 1.0, 0.8), idx=0
+  ):
     for mesh_obj in self.mesh_objs:
       if mesh_obj.idx == idx:
         mesh_obj.shaderProgram.set_wireframe_mode(wireframe, color)
 
-  def draw_lines(self,
-                 verts: np.ndarray,
-                 edges: np.ndarray,
-                 line_width=5.0,
-                 line_color=(0.8, 0.0, 0.7)):
+  def draw_lines(
+      self,
+      verts: np.ndarray,
+      edges: np.ndarray,
+      line_width=5.0,
+      line_color=(0.8, 0.0, 0.7),
+  ):
     edges = edges.reshape(-1, 2)
     glColor3f(line_color[0], line_color[1], line_color[2])
-    glLineWidth(line_width)
+    #glLineWidth(line_width)
     glBegin(GL_LINES)
     for edge in edges:
       glVertex2f(verts[edge[0], 0] * 2.0 - 1.0, verts[edge[0], 1] * 2.0 - 1.0)
@@ -403,10 +404,14 @@ class OpenGLMeshRenderer2D:
       mesh_obj.draw()
 
   def show(self):
-    if self.movie_track_mode and self.frame_count < self.movie_track_frames and self.frame_count > 0:
+    if (
+        self.movie_track_mode
+        and self.frame_count < self.movie_track_frames
+        and self.frame_count > 0
+    ):
       if self.frame_count % self.frame_per_track == 0:
         idx = self.frame_count // self.frame_per_track
-        self.get_screneshot(f'track/{idx:05d}.png')
+        self.get_screneshot(f"track/{idx:05d}.png")
     if self.movie_track_mode and self.frame_count == self.movie_track_frames:
       print("movie track complete")
     self.fps_count = int(1.0 / (glfw.get_time() - self.prev_time))
@@ -420,13 +425,13 @@ class OpenGLMeshRenderer2D:
     cps = np.array(glfw.get_cursor_pos(self.window))
     cps[0] = cps[0] / self.res[0]
     cps[1] = 1.0 - cps[1] / self.res[1]
-    #cps = (cps + 1.0) / 2.0
+    # cps = (cps + 1.0) / 2.0
     return cps
 
   def terminate(self):
     if self.fps_track:
       print(
-          f"avg fps is {np.sum(self.fps_record[100:]) / (self.fps_totalframes - 100):.3f}"
+        f"avg fps is {np.sum(self.fps_record[100:]) / (self.fps_totalframes - 100):.3f}"
       )
     glfw.terminate()
 
@@ -441,22 +446,24 @@ class OpenGLMeshRenderer2D:
         verts = mesh_obj.verts
         faces = mesh_obj.faces
     import matplotlib.pyplot as plt
+
     fig1, ax1 = plt.subplots()
-    ax1.set_aspect('equal')
-    tpc = ax1.tripcolor(verts[:, 0],
-                        verts[:, 1],
-                        faces.reshape(self.faces.size // 3, 3),
-                        facecolors=face_color,
-                        shading='flat')
+    ax1.set_aspect("equal")
+    tpc = ax1.tripcolor(
+      verts[:, 0],
+      verts[:, 1],
+      faces.reshape(self.faces.size // 3, 3),
+      facecolors=face_color,
+      shading="flat",
+    )
     fig1.colorbar(tpc)
     plt.savefig(filepath)
     plt.show()
 
   def get_screneshot(self, filepath):
     pixels = np.zeros(dtype=np.uint8, shape=3 * self.res[0] * self.res[1])
-    glReadPixels(0, 0, self.res[0], self.res[1], GL_RGB, GL_UNSIGNED_BYTE,
-                 pixels)
-    img = Image.fromarray(pixels.reshape(
-        (self.res[0], self.res[1],
-         3))).transpose(method=Image.Transpose.FLIP_TOP_BOTTOM)
+    glReadPixels(0, 0, self.res[0], self.res[1], GL_RGB, GL_UNSIGNED_BYTE, pixels)
+    img = Image.fromarray(pixels.reshape((self.res[0], self.res[1], 3))).transpose(
+      method=Image.Transpose.FLIP_TOP_BOTTOM
+    )
     img.save(filepath)

@@ -1,8 +1,11 @@
+import contextlib
+
 import taichi as ti
 import numpy as np
 from OpenGL.GL import *
 
 from utils import parser
+from utils.gl_basic_drawing import GL_BasicDrawing
 
 
 class PointsData2D:
@@ -26,7 +29,7 @@ class PointsData2D:
 
     self.c_A = ti.Matrix.field(2, 2, dtype=ti.f32, shape=self.n_points)
     self.c_A.from_numpy(
-        np.eye(2, dtype=np.float32).repeat(self.n_points, 0).reshape(-1, 2, 2))
+      np.eye(2, dtype=np.float32).repeat(self.n_points, 0).reshape(-1, 2, 2))
     self.c_b = ti.Vector.field(2, dtype=ti.f32, shape=self.n_points)
     self.c_b.from_numpy(np.zeros((self.n_points, 2), dtype=np.float32))
 
@@ -86,6 +89,10 @@ class PointLBS2D:
                                  shape=self.n_points)  # control point rotation
     for i in range(self.n_points):
       self.set_control_angle(i, 0.0)
+
+    # drawing is initialized on first use (segfaults if OpenGL context not ready)
+    self.basic_drawing = None
+
 
   def set_control_pos(self, idx: int, pos: np.ndarray):
     self.c_p[idx][0] = pos[0]
@@ -147,7 +154,7 @@ class PointLBS2D:
       B += self.v_weights[i, j] * q.outer_product(q) / self.v_invm[i]
     u, s, v = ti.svd(D @ B.inverse())
     self.c_rot[j] = u @ v.transpose()
-  
+
   @ti.kernel
   def inverse_mixed(self, j:ti.i32, blend: ti.f32):
     D = ti.Matrix([[0.0, 0.0], [0.0, 0.0]])
@@ -166,36 +173,48 @@ class PointLBS2D:
                           point_size=25.0,
                           point_color=(0.0, 0.9, 0.2),
                           fix_color=(0.9, 0.1, 0.0),
-                          fix_point=[],
+                          fix_point=None,
                           scale=1.0):
+
+    if self.basic_drawing is None:
+      self.basic_drawing = GL_BasicDrawing()
+
+    if fix_point is None:
+      fix_point = []
     trans = self.c_p.to_numpy()
     rot = self.c_rot.to_numpy()
 
-    def t2f(idx):
+    def t2f(idx) -> tuple[float]:
       p = trans[idx]
-      glVertex2f(p[0] * 2.0 - 1.0, p[1] * 2.0 - 1.0)
+      return p[0] * 2.0 - 1.0, p[1] * 2.0 - 1.0
 
-    glLineWidth(4 * scale)
-    glBegin(GL_LINES)
+    vertices = []
+    colors = []
     for i in range(self.n_points):
-      glColor3f(1.0, 0.5, 0.0)
-      t2f(i)
-      p = trans[i] + rot[i] @ np.array([0.07 * scale, 0.0])
-      glVertex2f(p[0] * 2.0 - 1.0, p[1] * 2.0 - 1.0)
-      glColor3f(0.0, 0.5, 1.0)
-      t2f(i)
-      p = trans[i] + rot[i] @ np.array([0.0, 0.07 * scale])
-      glVertex2f(p[0] * 2.0 - 1.0, p[1] * 2.0 - 1.0)
-    glEnd()
+      colors.append((1.0, 0.5, 0.0))
+      vertices.append(t2f(i))
 
-    glPointSize(point_size * scale)
-    glBegin(GL_POINTS)
+      p = trans[i] + rot[i] @ np.array([0.07 * scale, 0.0])
+      colors.append((1.0, 0.5, 0.0))
+      vertices.append((p[0] * 2.0 - 1.0, p[1] * 2.0 - 1.0))
+
+      colors.append((0.0, 0.5, 1.0))
+      vertices.append(t2f(i))
+
+      p = trans[i] + rot[i] @ np.array([0.0, 0.07 * scale])
+      colors.append((0.0, 0.5, 1.0))
+      vertices.append((p[0] * 2.0 - 1.0, p[1] * 2.0 - 1.0))
+    self.basic_drawing.draw_lines(vertices, colors, line_width=4 * scale)
+
+    vertices = []
+    colors = []
     for i in range(self.n_points):
       if i in fix_point:
-        glColor3f(fix_color[0], fix_color[1], fix_color[2])
-        t2f(i)
+        colors.append((fix_color[0], fix_color[1], fix_color[2]))
+        vertices.append(t2f(i))
       else:
-        glColor3f(point_color[0], point_color[1], point_color[2])
-        t2f(i)
+        colors.append((point_color[0], point_color[1], point_color[2]))
+        vertices.append(t2f(i))
 
-    glEnd()
+    self.basic_drawing.draw_points(vertices, colors, point_size=point_size * scale)
+
