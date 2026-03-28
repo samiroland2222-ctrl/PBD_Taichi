@@ -188,33 +188,31 @@ def build_coopers(skeleton,
                   n_ligaments: int = 60,
                   outer_z_min: float = 0.03,
                   pretension: float = 1.0,
-                  excluded_vertex_idx: np.ndarray = None):
+                  excluded_vertex_idx: np.ndarray = None,
+                  side: str = 'left'):
     """
-    Build Cooper's ligaments from the LEFT pectoral bone surface to the
-    outer surface of the left breast.
-
-    Anchors are sampled from the left pectoral surface verts.
-    Targets are the outer breast surface verts (z > outer_z_min), chosen
-    to be evenly spread using farthest-point-style greedy selection so
-    ligaments cover the whole breast surface rather than clustering.
+    Build Cooper's ligaments from one pectoral bone surface to the outer
+    surface of the corresponding breast mesh.
 
     Parameters
     ----------
+    side                  : 'left' or 'right' – which pectoral to anchor from
     skeleton              : geom.anatomy.Skeleton
     breast_pos_np         : (n_vert, 3) reference positions of ALL breast verts
-    breast_surface_idx_np : (n_surface,) indices into breast_pos_np that are
-                            on the surface (from TetMesh.f_i)
+    breast_surface_idx_np : (n_surface,) indices into breast_pos_np on surface
     breast_pos_field      : ti.MatrixField – live positions
     breast_invm_field     : ti.Field       – inverse masses
-    max_attach_dist       : anchors whose nearest outer-surface vert is farther
-                            than this are discarded
+    max_attach_dist       : discard anchors farther than this from any target
     n_ligaments           : how many ligament springs to create
-    outer_z_min           : minimum z to be considered "outer" surface
-                            (excludes the flat base at z≈0); raise this to
-                            avoid picking perimeter verts near the chest wall
-    excluded_vertex_idx   : optional array of vertex indices to never use as
-                            targets (e.g. the pinned base ring)
+    outer_z_min           : minimum z to be "outer" surface (excludes base)
+    excluded_vertex_idx   : vertex indices to never use as targets
     """
+    # ── pectoral anchors for the chosen side ─────────────────────────────
+    if side == 'left':
+        pec_anchors = skeleton.get_pec_left_surface_anchors_np()
+    else:
+        pec_anchors = skeleton.get_pec_right_surface_anchors_np()
+
     # ── outer breast surface verts only ──────────────────────────────────
     excluded_set = set(excluded_vertex_idx.tolist()) if excluded_vertex_idx is not None else set()
     all_surf_verts = breast_pos_np[breast_surface_idx_np]
@@ -225,7 +223,6 @@ def build_coopers(skeleton,
     outer_verts  = breast_pos_np[outer_global]
 
     # ── evenly distribute n_ligaments targets across outer surface ────────
-    # Greedy farthest-point sampling ensures even coverage.
     n_targets = min(n_ligaments, len(outer_global))
     selected  = [0]
     min_dists = np.full(len(outer_verts), np.inf)
@@ -233,16 +230,10 @@ def build_coopers(skeleton,
         d = np.linalg.norm(outer_verts - outer_verts[selected[-1]], axis=1)
         min_dists = np.minimum(min_dists, d)
         selected.append(int(np.argmax(min_dists)))
-    target_global = outer_global[selected]   # (n_targets,) breast vert indices
-    target_verts  = outer_verts[selected]    # (n_targets, 3)
+    target_global = outer_global[selected]
+    target_verts  = outer_verts[selected]
 
-    # ── left pectoral surface anchors ────────────────────────────────────
-    pec_anchors = skeleton.get_pec_left_surface_anchors_np()  # (n_pec_surf, 3)
-
-    # Assign anchors so they spread evenly across the bone surface.
-    # Strategy: for each target, find the nearest pec anchor that has been
-    # used the fewest times so far. This ensures pec_anchors are reused
-    # evenly rather than all targets collapsing to a single nearest point.
+    # ── assign anchors, spreading evenly across the bone ─────────────────
     use_count = np.zeros(len(pec_anchors), dtype=np.int32)
     chosen_anchor_pos  = []
     chosen_anchor_idx  = []
@@ -250,52 +241,40 @@ def build_coopers(skeleton,
 
     for ti_idx, tgt in zip(target_global, target_verts):
         dists = np.linalg.norm(pec_anchors - tgt, axis=1)
-
-        # Only consider anchors within max_attach_dist
         candidates = np.where(dists <= max_attach_dist)[0]
         if len(candidates) == 0:
             continue
-
-        # Among candidates, prefer the least-used anchor.
-        # Break ties by actual distance.
-        min_uses = use_count[candidates].min()
+        min_uses   = use_count[candidates].min()
         least_used = candidates[use_count[candidates] == min_uses]
-        nearest_of_least = least_used[np.argmin(dists[least_used])]
-
-        use_count[nearest_of_least] += 1
-        chosen_anchor_pos.append(pec_anchors[nearest_of_least])
-        chosen_anchor_idx.append(int(nearest_of_least))
+        chosen     = least_used[np.argmin(dists[least_used])]
+        use_count[chosen] += 1
+        chosen_anchor_pos.append(pec_anchors[chosen])
+        chosen_anchor_idx.append(int(chosen))
         kept_target_global.append(int(ti_idx))
 
     if len(kept_target_global) == 0:
         raise RuntimeError(
-            "[CoopersLigaments] No ligaments could be attached — "
-            "pectoral bone may be too far from the breast surface. "
+            f"[CoopersLigaments:{side}] No ligaments could be attached. "
             f"min pec-to-breast dist: "
-            f"{np.linalg.norm(pec_anchors[:,None]-target_verts[None],axis=2).min():.4f}m, "
-            f"max_attach_dist={max_attach_dist}")
+            f"{np.linalg.norm(pec_anchors[:,None]-target_verts[None],axis=2).min():.4f}m")
 
     anchor_pos_np     = np.array(chosen_anchor_pos,  dtype=np.float32)
     surface_idx_np    = np.array(kept_target_global,  dtype=np.int32)
     chosen_anchor_idx = np.array(chosen_anchor_idx,   dtype=np.int32)
 
-    print(f"[CoopersLigaments] {len(surface_idx_np)} ligaments attached "
-          f"across outer breast surface "
+    print(f"[CoopersLigaments:{side}] {len(surface_idx_np)} ligaments attached "
           f"({n_targets - len(surface_idx_np)} discarded as too far)")
 
     lig = CoopersLigaments(
-        breast_pos    = breast_pos_field,
-        breast_invm   = breast_invm_field,
-        anchor_pos_np = anchor_pos_np,
-        surface_idx_np= surface_idx_np,
-        dt            = dt,
-        alpha         = alpha,
-        pull_only     = pull_only,
-        pretension    = pretension,
+        breast_pos     = breast_pos_field,
+        breast_invm    = breast_invm_field,
+        anchor_pos_np  = anchor_pos_np,
+        surface_idx_np = surface_idx_np,
+        dt             = dt,
+        alpha          = alpha,
+        pull_only      = pull_only,
+        pretension     = pretension,
     )
-    # Store per-ligament index into the full pec anchor array so that
-    # update_anchors can scatter the right world position for every
-    # ligament, including when multiple ligaments share the same pec vert.
     lig._anchor_pec_idx = chosen_anchor_idx
     return lig, chosen_anchor_idx
 

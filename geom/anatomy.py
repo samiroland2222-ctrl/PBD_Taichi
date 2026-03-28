@@ -292,7 +292,11 @@ class Skeleton:
     # ------------------------------------------------------------------
     def get_pec_left_surface_anchors_np(self):
         """World-space positions of the left pectoral surface vertices."""
-        return self._pec_l_world[self._pec_l_surf_idx]   # (n_surf, 3)
+        return self.pec_l_v.to_numpy()[self._pec_l_surf_idx]   # (n_surf, 3)
+
+    def get_pec_right_surface_anchors_np(self):
+        """World-space positions of the right pectoral surface vertices."""
+        return self.pec_r_v.to_numpy()[self._pec_r_surf_idx]   # (n_surf, 3)
 
     # ------------------------------------------------------------------
     def reset_pose(self):
