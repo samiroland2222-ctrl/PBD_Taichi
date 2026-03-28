@@ -76,6 +76,11 @@ class TetMesh:
     for k in range(self.n_vert):
       self.v_invm[k] = 1.0 / self.v_invm[k]
 
+  @ti.kernel
+  def set_fixed_point(self, n: ti.i32, index: ti.template()):
+    for k in range(n):
+      self.v_invm[index[k]] = 0.0
+
   def get_render_draw(self, color=(0.5, 0.5, 0.5), wireframe=False):
 
     def render_draw(scene: ti.ui.Scene):

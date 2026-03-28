@@ -55,10 +55,19 @@ class TaichiRenderer3D:
       if self.window.event.key in self.keyboard_input:
         self.keyboard_input[self.window.event.key]()
 
+
+
   def render(self):
+    old_cam_pos = self.camera.curr_position
+    old_cam_lookat = self.camera.curr_lookat
+    old_cam_up = self.camera.curr_up
     self.camera.track_user_inputs(self.window,
                                   movement_speed=0.01,
                                   hold_key=ti.ui.RMB)
+    if (old_cam_pos - self.camera.curr_position).norm() > 0.00001 or (old_cam_lookat - self.camera.curr_lookat).norm() > 0.00001 or (old_cam_up - self.camera.curr_up).norm() > 0.00001:
+        print("Camera position: ", self.camera.curr_position)
+        print("Camera look at: ", self.camera.curr_lookat)
+        print("Camera up: ", self.camera.curr_up)
     self.scene.set_camera(self.camera)
     self.scene.ambient_light((0.8, 0.8, 0.8))
     self.scene.point_light(pos=self.camera.curr_position, color=(1, 1, 1))

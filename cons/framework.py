@@ -6,7 +6,7 @@ from utils.mathlib import isnan
 @ti.data_oriented
 class pbd_framework:
 
-  def __init__(self, n_vert, v_p, g, dt, damp=1.0) -> None:
+  def __init__(self, n_vert, v_p, g, dt, damp=1.0, invm=None) -> None:
     self.n_vert = n_vert
     self.v_p = v_p
     self.v_p_cache = ti.Vector.field(v_p.n, dtype=v_p.dtype, shape=n_vert)
@@ -16,6 +16,7 @@ class pbd_framework:
     self.g = g
     self.damp = ti.field(dtype=ti.f32, shape=())
     self.damp[None] = damp
+    self.invm = invm
 
     self.cons_list = [[]]
     self.initupdate = []
@@ -31,11 +32,28 @@ class pbd_framework:
           k] = self.v_p[k] + self.v_v[k] * self.dt + self.g * self.dt * self.dt
 
   @ti.kernel
+  def make_prediction_pinned(self, invm: ti.template()):
+    ti.loop_config(serialize=True)
+    for k in range(self.n_vert):
+      self.v_p_cache[k] = self.v_p[k]
+      if invm[k] > 0.0:
+        self.v_p[
+            k] = self.v_p[k] + self.v_v[k] * self.dt + self.g * self.dt * self.dt
+
+  @ti.kernel
   def update_vel(self):
     ti.loop_config(serialize=True)
     for k in range(self.n_vert):
       self.v_v[k] = self.damp[None] * (self.v_p[k] -
                                        self.v_p_cache[k]) / self.dt
+
+  @ti.kernel
+  def update_vel_pinned(self, invm: ti.template()):
+    ti.loop_config(serialize=True)
+    for k in range(self.n_vert):
+      if invm[k] > 0.0:
+        self.v_v[k] = self.damp[None] * (self.v_p[k] -
+                                         self.v_p_cache[k]) / self.dt
 
   def add_cons(self, new_cons, layer_index=0):
     if layer_index > len(self.cons_list):
