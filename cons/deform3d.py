@@ -12,9 +12,11 @@ class Deform3D:
                pos:ti.MatrixField,
                pos_ref:ti.MatrixField,
                tet_mass:ti.Field,
+               dt: float = 1.0/60,
                hydro_alpha=0.0,
                devia_alpha=0.0) -> None:
     self.n = n
+    self.dt = dt
     self.hydro_lambda = ti.field(dtype=ti.f32, shape=self.n)
     self.devia_lambda = ti.field(dtype=ti.f32, shape=self.n)
     self.hydro_alpha = hydro_alpha
@@ -32,8 +34,8 @@ class Deform3D:
     self.devia_lambda.fill(0.0)
     self.hydro_lambda.fill(0.0)
 
-  def update_cons(self, dt):
-    self.solve_cons(dt)
+  def update_cons(self):
+    self.solve_cons(self.dt)
 
   @ti.kernel
   def solve_cons(self, dt: ti.f32):
@@ -70,7 +72,7 @@ class Deform3D:
       par_CH_x4 = -par_CH_x1 - par_CH_x2 - par_CH_x3
       sum_par_CH = w1 * par_CH_x1.norm_sqr() + w2 * par_CH_x2.norm_sqr(
       ) + w3 * par_CH_x3.norm_sqr() + w4 * par_CH_x4.norm_sqr()
-      alpha_tilde_H = self.hydro_alpha / (dt[None] * dt[None] *
+      alpha_tilde_H = self.hydro_alpha / (dt * dt *
                                           self.tet_mass[k])
 
       C_D = F.norm_sqr() - 3.0
@@ -81,7 +83,7 @@ class Deform3D:
       par_CD_x4 = -par_CD_x1 - par_CD_x2 - par_CD_x3
       sum_par_CD = w1 * par_CD_x1.norm_sqr() + w2 * par_CD_x2.norm_sqr(
       ) + w3 * par_CD_x3.norm_sqr() + w4 * par_CD_x4.norm_sqr()
-      alpha_tilde_D = self.devia_alpha / (dt[None] * dt[None] *
+      alpha_tilde_D = self.devia_alpha / (dt * dt *
                                           self.tet_mass[k])
 
       sum_par_CDH = w1 * par_CD_x1.dot(par_CH_x1) + w2 * par_CD_x2.dot(
