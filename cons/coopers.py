@@ -71,6 +71,11 @@ class CoopersLigaments:
         self.anchor_pos = ti.Vector.field(3, dtype=ti.f32, shape=self.n)
         self.anchor_pos.from_numpy(anchor_pos_np.astype(np.float32))
 
+        # Index of the pec-surface anchor vert for each ligament.
+        # Used by update_anchors to scatter the right position when the
+        # pec array has fewer entries than self.n (N ligaments, M < N anchors).
+        self._anchor_pec_idx = None   # set by build_coopers after construction
+
         # Which breast vertex each anchor attaches to
         self.surface_idx = ti.field(dtype=ti.i32, shape=self.n)
         self.surface_idx.from_numpy(surface_idx_np.astype(np.int32))
@@ -96,9 +101,23 @@ class CoopersLigaments:
         self._alpha[None] = v / (self.dt * self.dt)
 
     # ------------------------------------------------------------------
-    def update_anchors(self, anchor_pos_np: np.ndarray):
-        """Call each frame with the skeleton's current fascia vertex positions."""
-        self.anchor_pos.from_numpy(anchor_pos_np.astype(np.float32))
+    def update_anchors(self, all_pec_anchor_pos_np: np.ndarray):
+        """
+        Update anchor world positions each frame.
+
+        all_pec_anchor_pos_np : (n_pec_surf, 3) – full pec surface vert array
+            from skeleton.get_pec_left_surface_anchors_np().
+
+        Uses self._anchor_pec_idx (set by build_coopers) to scatter the right
+        position into each of the self.n ligament anchor slots, correctly
+        handling multiple ligaments sharing the same pec anchor vert.
+        """
+        if self._anchor_pec_idx is None:
+            # Fallback: caller is passing a pre-indexed (n,3) array directly
+            self.anchor_pos.from_numpy(all_pec_anchor_pos_np.astype(np.float32))
+        else:
+            indexed = all_pec_anchor_pos_np[self._anchor_pec_idx]  # (n, 3)
+            self.anchor_pos.from_numpy(indexed.astype(np.float32))
 
     # ------------------------------------------------------------------
     @ti.kernel
@@ -167,8 +186,9 @@ def build_coopers(skeleton,
                   pull_only: bool = True,
                   max_attach_dist: float = 0.25,
                   n_ligaments: int = 60,
-                  outer_z_min: float = 0.005,
-                  pretension: float = 0.7):
+                  outer_z_min: float = 0.03,
+                  pretension: float = 1.0,
+                  excluded_vertex_idx: np.ndarray = None):
     """
     Build Cooper's ligaments from the LEFT pectoral bone surface to the
     outer surface of the left breast.
@@ -190,17 +210,19 @@ def build_coopers(skeleton,
                             than this are discarded
     n_ligaments           : how many ligament springs to create
     outer_z_min           : minimum z to be considered "outer" surface
-                            (excludes the flat base at z≈0)
+                            (excludes the flat base at z≈0); raise this to
+                            avoid picking perimeter verts near the chest wall
+    excluded_vertex_idx   : optional array of vertex indices to never use as
+                            targets (e.g. the pinned base ring)
     """
     # ── outer breast surface verts only ──────────────────────────────────
-    # Cooper's ligaments run from the clavicle/fascia (above) through
-    # breast tissue to the outer surface. Target the full outer surface
-    # (excluding only the flat posterior base at z≈0).
+    excluded_set = set(excluded_vertex_idx.tolist()) if excluded_vertex_idx is not None else set()
     all_surf_verts = breast_pos_np[breast_surface_idx_np]
-    outer_mask     = all_surf_verts[:, 2] > outer_z_min
-    outer_local    = np.where(outer_mask)[0]
-    outer_global   = breast_surface_idx_np[outer_local]
-    outer_verts    = breast_pos_np[outer_global]
+    outer_mask = (all_surf_verts[:, 2] > outer_z_min) & \
+                 np.array([i not in excluded_set for i in breast_surface_idx_np])
+    outer_local  = np.where(outer_mask)[0]
+    outer_global = breast_surface_idx_np[outer_local]
+    outer_verts  = breast_pos_np[outer_global]
 
     # ── evenly distribute n_ligaments targets across outer surface ────────
     # Greedy farthest-point sampling ensures even coverage.
@@ -217,20 +239,32 @@ def build_coopers(skeleton,
     # ── left pectoral surface anchors ────────────────────────────────────
     pec_anchors = skeleton.get_pec_left_surface_anchors_np()  # (n_pec_surf, 3)
 
-    # For each target breast vert, pick the nearest pectoral surface vert
-    # as its anchor — this naturally spreads anchors across the bone.
-    chosen_anchor_pos = []
-    chosen_anchor_idx = []   # index into pec_anchors array
+    # Assign anchors so they spread evenly across the bone surface.
+    # Strategy: for each target, find the nearest pec anchor that has been
+    # used the fewest times so far. This ensures pec_anchors are reused
+    # evenly rather than all targets collapsing to a single nearest point.
+    use_count = np.zeros(len(pec_anchors), dtype=np.int32)
+    chosen_anchor_pos  = []
+    chosen_anchor_idx  = []
     kept_target_global = []
 
     for ti_idx, tgt in zip(target_global, target_verts):
         dists = np.linalg.norm(pec_anchors - tgt, axis=1)
-        nearest_ai   = int(np.argmin(dists))
-        nearest_dist = dists[nearest_ai]
-        if nearest_dist > max_attach_dist:
+
+        # Only consider anchors within max_attach_dist
+        candidates = np.where(dists <= max_attach_dist)[0]
+        if len(candidates) == 0:
             continue
-        chosen_anchor_pos.append(pec_anchors[nearest_ai])
-        chosen_anchor_idx.append(nearest_ai)
+
+        # Among candidates, prefer the least-used anchor.
+        # Break ties by actual distance.
+        min_uses = use_count[candidates].min()
+        least_used = candidates[use_count[candidates] == min_uses]
+        nearest_of_least = least_used[np.argmin(dists[least_used])]
+
+        use_count[nearest_of_least] += 1
+        chosen_anchor_pos.append(pec_anchors[nearest_of_least])
+        chosen_anchor_idx.append(int(nearest_of_least))
         kept_target_global.append(int(ti_idx))
 
     if len(kept_target_global) == 0:
@@ -259,5 +293,9 @@ def build_coopers(skeleton,
         pull_only     = pull_only,
         pretension    = pretension,
     )
+    # Store per-ligament index into the full pec anchor array so that
+    # update_anchors can scatter the right world position for every
+    # ligament, including when multiple ligaments share the same pec vert.
+    lig._anchor_pec_idx = chosen_anchor_idx
     return lig, chosen_anchor_idx
 

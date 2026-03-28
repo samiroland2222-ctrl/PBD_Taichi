@@ -188,7 +188,7 @@ def _bone_capsule_verts_local(length=0.10, radius=0.018,
     # Lateral half of cylinder surface verts (x > length/2) → ligament anchors
     cyl_count = (rings + 1) * segs
     cyl_verts = verts[:cyl_count]
-    lateral_mask = cyl_verts[:, 0] > length * 0.5
+    lateral_mask = cyl_verts[:, 0] > length * 0.1
     lateral_surf_idx = np.where(lateral_mask)[0].astype(np.int32)
 
     return verts, faces, lateral_surf_idx
@@ -293,6 +293,15 @@ class Skeleton:
     def get_pec_left_surface_anchors_np(self):
         """World-space positions of the left pectoral surface vertices."""
         return self._pec_l_world[self._pec_l_surf_idx]   # (n_surf, 3)
+
+    # ------------------------------------------------------------------
+    def reset_pose(self):
+        """Zero all joint angles and recompute world positions."""
+        self.pec_left_pitch  = 0.0
+        self.pec_left_yaw    = 0.0
+        self.pec_right_pitch = 0.0
+        self.pec_right_yaw   = 0.0
+        self.update()
 
     # ------------------------------------------------------------------
     def get_render_draws(self, fascia_color=(0.85, 0.80, 0.95),

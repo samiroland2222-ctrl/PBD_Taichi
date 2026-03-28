@@ -32,7 +32,7 @@ xpbd = framework.pbd_framework(g=g, n_vert=mesh.n_vert, v_p=mesh.v_p,
 deform = deform3d.Deform3D(n=mesh.n_tet, indices=mesh.t_i,
                            invm=mesh.v_invm, pos=mesh.v_p,
                            pos_ref=mesh.v_p_ref, tet_mass=mesh.t_mass,
-                           dt=dt, hydro_alpha=1e0, devia_alpha=1e2)
+                           dt=dt, hydro_alpha=1e-2, devia_alpha=1e1)
 xpbd.add_cons(deform)
 xpbd.add_collision(box3d.collision)
 xpbd.init_rest_status()
@@ -56,17 +56,18 @@ surf_vert_idx = np.unique(surf_face_idx)   # sorted unique vertex indices
 
 ligaments, _anchor_map = coopers.build_coopers(
     skeleton           = skel,
-    breast_pos_np      = verts_np,
+    breast_pos_np         = verts_np,
     breast_surface_idx_np = surf_vert_idx,
-    breast_pos_field   = mesh.v_p,
-    breast_invm_field  = mesh.v_invm,
-    dt                 = dt,
-    alpha              = 1e-3,
-    pull_only          = True,
-    max_attach_dist    = 0.5,
-    n_ligaments        = 60,
-    outer_z_min        = 0.005,
-    pretension         = 1.0,
+    breast_pos_field      = mesh.v_p,
+    breast_invm_field     = mesh.v_invm,
+    dt                    = dt,
+    alpha                 = 1e+3,
+    pull_only             = True,
+    max_attach_dist       = 0.5,
+    n_ligaments           = 90,
+    outer_z_min           = 0.03,
+    pretension            = 1.0,
+    excluded_vertex_idx   = base_idx_np,
 )
 xpbd.add_cons(ligaments)
 ligaments.init_rest_status()
@@ -74,11 +75,11 @@ ligaments.init_rest_status()
 # ── Renderer ──────────────────────────────────────────────────────────────────
 tirender = renderer.TaichiRenderer3D("Deform 3D – Cooper's Ligaments",
                                      res=(900, 900), fps=fps,
-                                     cameraPos=(0.0, 0.15, 0.45),
-                                     cameraLookat=(0.0, 0.0, 0.05))
+                                     cameraPos=(0.5, 0.15, 0.2),
+                                     cameraLookat=(-0.4, -0.03, -0.17))
 
 tirender.add_scene_render_draw(mesh.get_render_draw(color=(0.85, 0.65, 0.55),
-                                                    wireframe=True))
+                                                    wireframe=False))
 for draw in skel.get_render_draws():
     tirender.add_scene_render_draw(draw)
 tirender.add_scene_render_draw(ligaments.get_render_draw())
@@ -98,7 +99,7 @@ def gui_draw(gui):
     gui.text(f"  hydro={deform.hydro_alpha:.2e}  devia={deform.devia_alpha:.2e}")
 
     gui.text("── Cooper's ligaments ──")
-    log_lig_alpha[0] = gui.slider_float("log10(lig alpha)", log_lig_alpha[0], -6.0, 0.0)
+    log_lig_alpha[0] = gui.slider_float("log10(lig alpha)", log_lig_alpha[0], -1.0, 6.0)
     ligaments.alpha = 10 ** log_lig_alpha[0]
     gui.text(f"  alpha={ligaments.alpha:.2e}  n={ligaments.n}")
 
@@ -125,7 +126,10 @@ def sim_reset():
     # Restore inverse masses (reset_mass refills in-place without realloc)
     mesh.reset_mass(rho=1.0)
     mesh.set_fixed_point(len(base_idx_np), base_idx)
-    # Re-initialise constraint lambdas
+    # Reset skeleton pose and push anchor positions before re-init
+    skel.reset_pose()
+    ligaments.update_anchors(skel.get_pec_left_surface_anchors_np())
+    # Re-initialise constraint lambdas and rest lengths
     xpbd.init_rest_status()
     ligaments.init_rest_status()
     sim['frame'] = 0
