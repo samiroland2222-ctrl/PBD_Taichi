@@ -64,6 +64,21 @@ tirender = renderer.TaichiRenderer3D("Deform 3D",
 tirender.add_scene_render_draw(mesh.get_render_draw(color=(0.8, 0.6, 0.5),
                                                     wireframe=False))
 
+# Sliders for stiffness parameters (log10 scale: 1e-3 .. 1e3)
+import math
+log_hydro = [math.log10(deform.hydro_alpha)]
+log_devia = [math.log10(deform.devia_alpha)]
+
+def gui_draw(gui):
+  log_hydro[0] = gui.slider_float("log10(hydro_alpha)", log_hydro[0], -3.0, 3.0)
+  log_devia[0] = gui.slider_float("log10(devia_alpha)", log_devia[0], -3.0, 3.0)
+  deform.hydro_alpha = 10 ** log_hydro[0]
+  deform.devia_alpha = 10 ** log_devia[0]
+  gui.text(f"hydro_alpha: {deform.hydro_alpha:.2e}")
+  gui.text(f"devia_alpha: {deform.devia_alpha:.2e}")
+
+tirender.add_gui_draw(gui_draw)
+
 while tirender.window.running:
   tirender.handle_input()
 

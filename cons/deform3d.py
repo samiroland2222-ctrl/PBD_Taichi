@@ -19,13 +19,31 @@ class Deform3D:
     self.dt = dt
     self.hydro_lambda = ti.field(dtype=ti.f32, shape=self.n)
     self.devia_lambda = ti.field(dtype=ti.f32, shape=self.n)
-    self.hydro_alpha = hydro_alpha
-    self.devia_alpha = devia_alpha
+    self._hydro_alpha = ti.field(dtype=ti.f32, shape=())
+    self._devia_alpha = ti.field(dtype=ti.f32, shape=())
+    self._hydro_alpha[None] = hydro_alpha
+    self._devia_alpha[None] = devia_alpha
     self.indices = indices
     self.invm = invm
     self.tet_mass = tet_mass
     self.pos = pos
     self.pos_ref = pos_ref
+
+  @property
+  def hydro_alpha(self):
+    return self._hydro_alpha[None]
+
+  @hydro_alpha.setter
+  def hydro_alpha(self, v):
+    self._hydro_alpha[None] = v
+
+  @property
+  def devia_alpha(self):
+    return self._devia_alpha[None]
+
+  @devia_alpha.setter
+  def devia_alpha(self, v):
+    self._devia_alpha[None] = v
 
   def init_rest_status(self):
     pass
@@ -72,7 +90,7 @@ class Deform3D:
       par_CH_x4 = -par_CH_x1 - par_CH_x2 - par_CH_x3
       sum_par_CH = w1 * par_CH_x1.norm_sqr() + w2 * par_CH_x2.norm_sqr(
       ) + w3 * par_CH_x3.norm_sqr() + w4 * par_CH_x4.norm_sqr()
-      alpha_tilde_H = self.hydro_alpha / (dt * dt *
+      alpha_tilde_H = self._hydro_alpha[None] / (dt * dt *
                                           self.tet_mass[k])
 
       C_D = F.norm_sqr() - 3.0
@@ -83,7 +101,7 @@ class Deform3D:
       par_CD_x4 = -par_CD_x1 - par_CD_x2 - par_CD_x3
       sum_par_CD = w1 * par_CD_x1.norm_sqr() + w2 * par_CD_x2.norm_sqr(
       ) + w3 * par_CD_x3.norm_sqr() + w4 * par_CD_x4.norm_sqr()
-      alpha_tilde_D = self.devia_alpha / (dt * dt *
+      alpha_tilde_D = self._devia_alpha[None] / (dt * dt *
                                           self.tet_mass[k])
 
       sum_par_CDH = w1 * par_CD_x1.dot(par_CH_x1) + w2 * par_CD_x2.dot(
