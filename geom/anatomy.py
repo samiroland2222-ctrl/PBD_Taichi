@@ -81,7 +81,7 @@ def _fascia_verts_local():
     return np.array(verts, dtype=np.float32), np.array(faces, dtype=np.int32)
 
 
-def _bone_capsule_verts_local(length=0.10, radius=0.018,
+def _bone_capsule_verts_local(length=0.15, radius=0.018,
                                rings=8, segs=10):
     """
     Capsule with long axis along +x.  Local origin = MEDIAL end (pivot).
@@ -213,7 +213,7 @@ class Skeleton:
     z ∈ [0, 0.1].
     """
 
-    def __init__(self, chest_pos=(0.0, 0.13, 0.0)):
+    def __init__(self, chest_pos=(0.0, 0.08, 0.0)):
         self.chest_pos = np.array(chest_pos, dtype=np.float32)
 
         self.pec_left_pitch  = 0.0   # rot around Z: tilts lateral end up/down

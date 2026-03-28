@@ -13,9 +13,9 @@ ti.init(arch=ti.cpu, cpu_max_num_threads=1)
 # Right breast: mirrored at negative x — flip x by negating repose and
 #               reflecting the loaded verts through x=0.
 mesh_l = gtet.TetMesh("assets/mesh/breast.msh",
-                       rho=1.0, scale=1.0, repose=( 0.06, 0.0, 0.0))
+                       rho=1.0, scale=1.0, repose=( 0.08, 0.0, 0.0))
 mesh_r = gtet.TetMesh("assets/mesh/breast.msh",
-                       rho=1.0, scale=1.0, repose=( 0.06, 0.0, 0.0))
+                       rho=1.0, scale=1.0, repose=( 0.08, 0.0, 0.0))
 
 # Mirror the right breast through x=0: x → -x gives [-0.14, +0.02]
 def _mirror_x(mesh):
