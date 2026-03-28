@@ -110,20 +110,88 @@ def gui_draw(gui):
 
 tirender.add_gui_draw(gui_draw)
 
+# ── Simulation control state ──────────────────────────────────────────────────
+sim = {
+    'paused':    False,
+    'step_once': False,   # advance exactly one frame then pause
+    'sim_rate':  1.0,     # multiplier relative to real time (1 = real-time)
+    'frame':     0,
+}
+
+def sim_reset():
+    """Restore every dynamic field to its initial state."""
+    mesh.v_p.copy_from(mesh.v_p_ref)
+    xpbd.v_v.fill(0)
+    # Restore inverse masses (reset_mass refills in-place without realloc)
+    mesh.reset_mass(rho=1.0)
+    mesh.set_fixed_point(len(base_idx_np), base_idx)
+    # Re-initialise constraint lambdas
+    xpbd.init_rest_status()
+    ligaments.init_rest_status()
+    sim['frame'] = 0
+
+def gui_draw_debug(gui):
+    gui.text("── Simulation control ──")
+
+    # Pause / Resume button
+    label = "Resume" if sim['paused'] else "Pause"
+    if gui.button(label):
+        sim['paused'] = not sim['paused']
+
+    # Step one frame
+    if gui.button("Step"):
+        sim['paused']    = True
+        sim['step_once'] = True
+
+    # Reset
+    if gui.button("Reset"):
+        sim_reset()
+
+    # Sim rate slider
+    sim['sim_rate'] = gui.slider_float("Sim rate", sim['sim_rate'], 0.0, 2.0)
+    rate = sim['sim_rate']
+    status = 'PAUSED' if sim['paused'] else f'x{rate:.2f}'
+    gui.text(f"  frame={sim['frame']}  {status}")
+
+tirender.add_gui_draw(gui_draw_debug)
+
 # ── Main loop ─────────────────────────────────────────────────────────────────
+import time as _time
+
+_accum = 0.0          # accumulated simulation time debt (seconds)
+_wall_prev = _time.time()
+
 while tirender.window.running:
     tirender.handle_input()
 
-    # Update skeleton world positions, then push to ligament anchors
+    # Always update skeleton (so joints move even when paused)
     skel.update()
     ligaments.update_anchors(skel.get_pec_left_surface_anchors_np())
 
-    for _ in range(substep):
-        xpbd.make_prediction_pinned(mesh.v_invm)
-        xpbd.preupdate_cons()
-        for _ in range(solve_step):
-            xpbd.update_cons()
-        xpbd.update_vel_pinned(mesh.v_invm)
+    # Decide whether to tick the simulation this frame
+    wall_now   = _time.time()
+    wall_delta = wall_now - _wall_prev
+    _wall_prev = wall_now
+
+    should_step = False
+    if sim['step_once']:
+        should_step      = True
+        sim['step_once'] = False
+    elif not sim['paused']:
+        _accum += wall_delta * sim['sim_rate']
+        frame_dt = 1.0 / fps
+        if _accum >= frame_dt:
+            _accum    -= frame_dt
+            should_step = True
+
+    if should_step:
+        for _ in range(substep):
+            xpbd.make_prediction_pinned(mesh.v_invm)
+            xpbd.preupdate_cons()
+            for _ in range(solve_step):
+                xpbd.update_cons()
+            xpbd.update_vel_pinned(mesh.v_invm)
+        sim['frame'] += 1
 
     tirender.render()
 

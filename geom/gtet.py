@@ -83,6 +83,12 @@ class TetMesh:
     self.t_mass = ti.field(dtype=ti.f32, shape=self.n_tet)
     self.get_mass(rho)
 
+  def reset_mass(self, rho: float):
+    """Refill v_invm and t_mass in-place (no reallocation). Use for sim reset."""
+    self.v_invm.fill(0)
+    self.t_mass.fill(0)
+    self.get_mass(rho)
+
   @ti.kernel
   def get_mass(self, rho: ti.f32):
     for k in range(self.n_tet):
