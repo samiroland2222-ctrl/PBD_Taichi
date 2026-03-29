@@ -4,8 +4,8 @@ Cooper's Ligaments constraint for the breast simulation.
 Phase 1 – Simple anchor springs
 ────────────────────────────────
 Each ligament is a distance spring between:
-  • a fixed world-space anchor point on the clavipectoral fascia
-  • the closest surface vertex of the breast mesh
+  • a fixed world-space anchor point on the clavicle and/or clavicular fascia
+  • a surface vertex of the breast mesh
 
 The spring is one-sided when rest_length is used as an upper bound
 (only pulls, never pushes), which mimics the collagen strand behaviour:
@@ -71,10 +71,10 @@ class CoopersLigaments:
         self.anchor_pos = ti.Vector.field(3, dtype=ti.f32, shape=self.n)
         self.anchor_pos.from_numpy(anchor_pos_np.astype(np.float32))
 
-        # Index of the pec-surface anchor vert for each ligament.
+        # Index of the clavicle anchor vert for each ligament.
         # Used by update_anchors to scatter the right position when the
-        # pec array has fewer entries than self.n (N ligaments, M < N anchors).
-        self._anchor_pec_idx = None   # set by build_coopers after construction
+        # clavicle array has fewer entries than self.n (N ligaments, M < N anchors).
+        self._anchor_clavicle_idx = None   # set by build_coopers after construction
 
         # Which breast vertex each anchor attaches to
         self.surface_idx = ti.field(dtype=ti.i32, shape=self.n)
@@ -101,22 +101,22 @@ class CoopersLigaments:
         self._alpha[None] = v / (self.dt * self.dt)
 
     # ------------------------------------------------------------------
-    def update_anchors(self, all_pec_anchor_pos_np: np.ndarray):
+    def update_anchors(self, all_clavicle_anchor_pos_np: np.ndarray):
         """
         Update anchor world positions each frame.
 
-        all_pec_anchor_pos_np : (n_pec_surf, 3) – full pec surface vert array
-            from skeleton.get_pec_left_surface_anchors_np().
+        all_clavicle_anchor_pos_np : (n_clavicle_surf, 3) – full clavicle surface vert array
+            from skeleton.get_clavicle_left_surface_anchors_np().
 
-        Uses self._anchor_pec_idx (set by build_coopers) to scatter the right
+        Uses self._anchor_clavicle_idx (set by build_coopers) to scatter the right
         position into each of the self.n ligament anchor slots, correctly
-        handling multiple ligaments sharing the same pec anchor vert.
+        handling multiple ligaments sharing the same clavicle anchor vert.
         """
-        if self._anchor_pec_idx is None:
+        if self._anchor_clavicle_idx is None:
             # Fallback: caller is passing a pre-indexed (n,3) array directly
-            self.anchor_pos.from_numpy(all_pec_anchor_pos_np.astype(np.float32))
+            self.anchor_pos.from_numpy(all_clavicle_anchor_pos_np.astype(np.float32))
         else:
-            indexed = all_pec_anchor_pos_np[self._anchor_pec_idx]  # (n, 3)
+            indexed = all_clavicle_anchor_pos_np[self._anchor_clavicle_idx]  # (n, 3)
             self.anchor_pos.from_numpy(indexed.astype(np.float32))
 
     # ------------------------------------------------------------------
@@ -191,12 +191,12 @@ def build_coopers(skeleton,
                   excluded_vertex_idx: np.ndarray = None,
                   side: str = 'left'):
     """
-    Build Cooper's ligaments from one pectoral bone surface to the outer
+    Build Cooper's ligaments from one clavicle bone surface to the outer
     surface of the corresponding breast mesh.
 
     Parameters
     ----------
-    side                  : 'left' or 'right' – which pectoral to anchor from
+    side                  : 'left' or 'right' – which clavicle to anchor from
     skeleton              : geom.anatomy.Skeleton
     breast_pos_np         : (n_vert, 3) reference positions of ALL breast verts
     breast_surface_idx_np : (n_surface,) indices into breast_pos_np on surface
@@ -207,11 +207,11 @@ def build_coopers(skeleton,
     outer_z_min           : minimum z to be "outer" surface (excludes base)
     excluded_vertex_idx   : vertex indices to never use as targets
     """
-    # ── pectoral anchors for the chosen side ─────────────────────────────
+    # ── clavicle anchors for the chosen side ─────────────────────────────
     if side == 'left':
-        pec_anchors = skeleton.get_pec_left_surface_anchors_np()
+        clavicle_anchors = skeleton.get_clavicle_left_surface_anchors_np()
     else:
-        pec_anchors = skeleton.get_pec_right_surface_anchors_np()
+        clavicle_anchors = skeleton.get_clavicle_right_surface_anchors_np()
 
     # ── outer breast surface verts only ──────────────────────────────────
     excluded_set = set(excluded_vertex_idx.tolist()) if excluded_vertex_idx is not None else set()
@@ -234,13 +234,13 @@ def build_coopers(skeleton,
     target_verts  = outer_verts[selected]
 
     # ── assign anchors, spreading evenly across the bone ─────────────────
-    use_count = np.zeros(len(pec_anchors), dtype=np.int32)
+    use_count = np.zeros(len(clavicle_anchors), dtype=np.int32)
     chosen_anchor_pos  = []
     chosen_anchor_idx  = []
     kept_target_global = []
 
     for ti_idx, tgt in zip(target_global, target_verts):
-        dists = np.linalg.norm(pec_anchors - tgt, axis=1)
+        dists = np.linalg.norm(clavicle_anchors - tgt, axis=1)
         candidates = np.where(dists <= max_attach_dist)[0]
         if len(candidates) == 0:
             continue
@@ -248,15 +248,15 @@ def build_coopers(skeleton,
         least_used = candidates[use_count[candidates] == min_uses]
         chosen     = least_used[np.argmin(dists[least_used])]
         use_count[chosen] += 1
-        chosen_anchor_pos.append(pec_anchors[chosen])
+        chosen_anchor_pos.append(clavicle_anchors[chosen])
         chosen_anchor_idx.append(int(chosen))
         kept_target_global.append(int(ti_idx))
 
     if len(kept_target_global) == 0:
         raise RuntimeError(
             f"[CoopersLigaments:{side}] No ligaments could be attached. "
-            f"min pec-to-breast dist: "
-            f"{np.linalg.norm(pec_anchors[:,None]-target_verts[None],axis=2).min():.4f}m")
+            f"min clavicle-to-breast dist: "
+            f"{np.linalg.norm(clavicle_anchors[:,None]-target_verts[None],axis=2).min():.4f}m")
 
     anchor_pos_np     = np.array(chosen_anchor_pos,  dtype=np.float32)
     surface_idx_np    = np.array(kept_target_global,  dtype=np.int32)
@@ -275,6 +275,6 @@ def build_coopers(skeleton,
         pull_only      = pull_only,
         pretension     = pretension,
     )
-    lig._anchor_pec_idx = chosen_anchor_idx
+    lig._anchor_clavicle_idx = chosen_anchor_idx
     return lig, chosen_anchor_idx
 

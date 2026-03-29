@@ -5,11 +5,11 @@ Hierarchy:
   chest (root, static)
   └── clavipectoral_fascia  – broad band across upper chest, child of chest,
                               no independent motion
-  └── pectoral_left         – left pectoralis major, child of chest,
+  └── clavicle_left         – left clavicle, child of chest,
                               can pitch (up/down) and yaw (forward/back)
-  └── pectoral_right        – right pectoralis major, same DOF
+  └── clavicle_right        – right clavicle, same DOF
 
-The breast mesh models the LEFT breast, positioned at ~x=+0.06 (patient's
+A models each breast. The LEFT breast is positioned at ~x=+0.06 (patient's
 left when facing the camera, +x in our coordinate system).
 
 Coordinate convention (matches breast mesh):
@@ -17,8 +17,8 @@ Coordinate convention (matches breast mesh):
   y  – inferior(−)/superior(+)
   z  – posterior(0, chest wall) / anterior(+, outward)
 
-Cooper's ligaments run from the surface of the left pectoral bone to the
-outer surface of the left breast.
+Cooper's ligaments run from the surface of the clavicles to the
+outer surface of the breasts.
 """
 
 import numpy as np
@@ -201,11 +201,11 @@ def _bone_capsule_verts_local(length=0.15, radius=0.018,
 @ti.data_oriented
 class Skeleton:
     """
-    Skeletal proxy for pectoral anatomy surrounding the LEFT breast.
+    Skeletal proxy for pectoral anatomy surrounding the breasts.
 
-    The pectoral bones run horizontally (long axis = X).  Meaningful DOF:
-      pec_left_pitch  – tilt the bone's lateral end up/down  (rot around Z)
-      pec_left_yaw    – swing the bone anteriorly/posteriorly (rot around Y)
+    The clavicles run horizontally (long axis = X).  Meaningful DOF:
+      clavicle_left_pitch  – tilt the bone's lateral end up/down  (rot around Z)
+      clavicle_left_yaw    – swing the bone anteriorly/posteriorly (rot around Y)
       (same for right)
 
     chest_pos is the world-space root at the chest wall (z ≈ 0).
@@ -216,43 +216,43 @@ class Skeleton:
     def __init__(self, chest_pos=(0.0, 0.08, 0.0)):
         self.chest_pos = np.array(chest_pos, dtype=np.float32)
 
-        self.pec_left_pitch  = 0.0   # rot around Z: tilts lateral end up/down
-        self.pec_left_yaw    = 0.0   # rot around Y: swings bone forward/back
-        self.pec_right_pitch = 0.0
-        self.pec_right_yaw   = 0.0
+        self.clavicle_left_pitch  = 0.0   # rot around Z: tilts lateral end up/down
+        self.clavicle_left_yaw    = 0.0   # rot around Y: swings bone forward/back
+        self.clavicle_right_pitch = 0.0
+        self.clavicle_right_yaw   = 0.0
 
         # ── local geometry ────────────────────────────────────────────────
         self._fascia_v_local, self._fascia_f_np = _fascia_verts_local()
 
-        (self._pec_l_v_local, self._pec_l_f_np,
-         self._pec_l_surf_idx) = _bone_capsule_verts_local()
-        (self._pec_r_v_local, self._pec_r_f_np,
-         self._pec_r_surf_idx) = _bone_capsule_verts_local()
+        (self._clavicle_l_v_local, self._clavicle_l_f_np,
+         self._clavicle_l_surf_idx) = _bone_capsule_verts_local()
+        (self._clavicle_r_v_local, self._clavicle_r_f_np,
+         self._clavicle_r_surf_idx) = _bone_capsule_verts_local()
 
         # ── joint offsets from chest_pos ──────────────────────────────────
         # fascia: wide band across upper chest at chest wall
         self._fascia_offset  = np.array([0.0,  -0.01,  0.005], dtype=np.float32)
 
-        # Left pectoral: local x=0 is the pivot (medial/sternum end).
+        # Left clavicle: local x=0 is the pivot (medial/sternum end).
         # Place it so the medial end is at world x ≈ 0.01 (just right of midline).
         # offset is added to chest_pos=(0, 0.13, 0), so world medial end =
         # chest_pos + offset = (0.02, 0.12, 0.02).
-        self._pec_l_offset   = np.array([ 0.02,  -0.01,  0.02], dtype=np.float32)
+        self._clavicle_l_offset   = np.array([0.02, -0.01, 0.02], dtype=np.float32)
 
-        # Right pectoral: medial end at x ≈ -0.02.
+        # Right clavicle: medial end at x ≈ -0.02.
         # The right bone geometry needs its x-axis flipped so it extends toward -x.
-        self._pec_r_offset   = np.array([-0.02,  -0.01,  0.02], dtype=np.float32)
+        self._clavicle_r_offset   = np.array([-0.02, -0.01, 0.02], dtype=np.float32)
 
         # ── Taichi fields ─────────────────────────────────────────────────
         self.fascia_v, self.fascia_f = _make_ti_mesh(
             self._fascia_v_local, self._fascia_f_np)
-        self.pec_l_v,  self.pec_l_f  = _make_ti_mesh(
-            self._pec_l_v_local,  self._pec_l_f_np)
-        self.pec_r_v,  self.pec_r_f  = _make_ti_mesh(
-            self._pec_r_v_local,  self._pec_r_f_np)
+        self.clavicle_l_v,  self.clavicle_l_f  = _make_ti_mesh(
+            self._clavicle_l_v_local,  self._clavicle_l_f_np)
+        self.clavicle_r_v,  self.clavicle_r_f  = _make_ti_mesh(
+            self._clavicle_r_v_local,  self._clavicle_r_f_np)
 
-        # world-space cache of left pectoral surface verts (for anchors)
-        self._pec_l_world = self._pec_l_v_local.copy()
+        # world-space cache of left clavicle surface verts (for anchors)
+        self._clavicle_l_world = self._clavicle_l_v_local.copy()
 
         self.update()
 
@@ -274,49 +274,49 @@ class Skeleton:
             c, s = np.cos(a), np.sin(a)
             return np.array([[c,-s,0],[s,c,0],[0,0,1]], dtype=np.float32)
 
-        R_l = _rot_y(self.pec_left_yaw)  @ _rot_z(self.pec_left_pitch)
-        R_r = _rot_y(self.pec_right_yaw) @ _rot_z(-self.pec_right_pitch)
+        R_l = _rot_y(self.clavicle_left_yaw) @ _rot_z(self.clavicle_left_pitch)
+        R_r = _rot_y(self.clavicle_right_yaw) @ _rot_z(-self.clavicle_right_pitch)
 
-        self._pec_l_world = self._transform_verts(
-            self._pec_l_v_local, R_l, self._pec_l_offset)
+        self._clavicle_l_world = self._transform_verts(
+            self._clavicle_l_v_local, R_l, self._clavicle_l_offset)
 
         # Right bone: flip x so it extends toward -x (right shoulder)
-        pec_r_local_mirrored = self._pec_r_v_local.copy()
-        pec_r_local_mirrored[:, 0] *= -1
-        pec_r_world = self._transform_verts(
-            pec_r_local_mirrored, R_r, self._pec_r_offset)
+        clavicle_r_local_mirrored = self._clavicle_r_v_local.copy()
+        clavicle_r_local_mirrored[:, 0] *= -1
+        clavicle_r_world = self._transform_verts(
+            clavicle_r_local_mirrored, R_r, self._clavicle_r_offset)
 
-        self.pec_l_v.from_numpy(self._pec_l_world)
-        self.pec_r_v.from_numpy(pec_r_world)
+        self.clavicle_l_v.from_numpy(self._clavicle_l_world)
+        self.clavicle_r_v.from_numpy(clavicle_r_world)
 
     # ------------------------------------------------------------------
-    def get_pec_left_surface_anchors_np(self):
-        """World-space positions of the left pectoral surface vertices."""
-        return self.pec_l_v.to_numpy()[self._pec_l_surf_idx]   # (n_surf, 3)
+    def get_clavicle_left_surface_anchors_np(self):
+        """World-space positions of the left clavicle surface vertices."""
+        return self.clavicle_l_v.to_numpy()[self._clavicle_l_surf_idx]   # (n_surf, 3)
 
-    def get_pec_right_surface_anchors_np(self):
-        """World-space positions of the right pectoral surface vertices."""
-        return self.pec_r_v.to_numpy()[self._pec_r_surf_idx]   # (n_surf, 3)
+    def get_clavicle_right_surface_anchors_np(self):
+        """World-space positions of the right clavicle surface vertices."""
+        return self.clavicle_r_v.to_numpy()[self._clavicle_r_surf_idx]   # (n_surf, 3)
 
     # ------------------------------------------------------------------
     def reset_pose(self):
         """Zero all joint angles and recompute world positions."""
-        self.pec_left_pitch  = 0.0
-        self.pec_left_yaw    = 0.0
-        self.pec_right_pitch = 0.0
-        self.pec_right_yaw   = 0.0
+        self.clavicle_left_pitch  = 0.0
+        self.clavicle_left_yaw    = 0.0
+        self.clavicle_right_pitch = 0.0
+        self.clavicle_right_yaw   = 0.0
         self.update()
 
     # ------------------------------------------------------------------
     def get_render_draws(self, fascia_color=(0.85, 0.80, 0.95),
-                         pec_color=(0.60, 0.35, 0.35)):
+                         claivcle_color=(0.60, 0.35, 0.35)):
         def draw_fascia(scene):
             scene.mesh(self.fascia_v, self.fascia_f,
                        color=fascia_color, two_sided=True)
-        def draw_pec_l(scene):
-            scene.mesh(self.pec_l_v, self.pec_l_f,
-                       color=pec_color, two_sided=True)
-        def draw_pec_r(scene):
-            scene.mesh(self.pec_r_v, self.pec_r_f,
-                       color=pec_color, two_sided=True)
-        return [draw_fascia, draw_pec_l, draw_pec_r]
+        def draw_clavicle_l(scene):
+            scene.mesh(self.clavicle_l_v, self.clavicle_l_f,
+                       color=claivcle_color, two_sided=True)
+        def draw_clavicle_r(scene):
+            scene.mesh(self.clavicle_r_v, self.clavicle_r_f,
+                       color=claivcle_color, two_sided=True)
+        return [draw_fascia, draw_clavicle_l, draw_clavicle_r]

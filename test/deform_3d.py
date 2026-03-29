@@ -187,11 +187,11 @@ def gui_draw(gui):
         lig.alpha = 10 ** log_lig_alpha[0]
     gui.text(f"  alpha={ligaments_l.alpha:.2e}  n_l={ligaments_l.n}  n_r={ligaments_r.n}")
 
-    gui.text("── Pectoral joints ──")
-    skel.pec_left_pitch  = gui.slider_float("L pitch", skel.pec_left_pitch,  -0.5, 0.5)
-    skel.pec_left_yaw    = gui.slider_float("L yaw",   skel.pec_left_yaw,   -0.5, 0.5)
-    skel.pec_right_pitch = gui.slider_float("R pitch", skel.pec_right_pitch, -0.5, 0.5)
-    skel.pec_right_yaw   = gui.slider_float("R yaw",   skel.pec_right_yaw,  -0.5, 0.5)
+    gui.text("── Clavicle joints ──")
+    skel.clavicle_left_pitch  = gui.slider_float("L pitch", skel.clavicle_left_pitch, -0.5, 0.5)
+    skel.clavicle_left_yaw    = gui.slider_float("L yaw", skel.clavicle_left_yaw, -0.5, 0.5)
+    skel.clavicle_right_pitch = gui.slider_float("R pitch", skel.clavicle_right_pitch, -0.5, 0.5)
+    skel.clavicle_right_yaw   = gui.slider_float("R yaw", skel.clavicle_right_yaw, -0.5, 0.5)
 
 tirender.add_gui_draw(gui_draw)
 
@@ -201,9 +201,9 @@ sim = {'paused': False, 'step_once': False, 'sim_rate': 1.0, 'frame': 0}
 def sim_reset():
     for mesh, xpbd, base_idx_np, base_idx_ti, lig, get_anchors in [
         (mesh_l, xpbd_l, base_idx_l_np, base_idx_l, ligaments_l,
-         skel.get_pec_left_surface_anchors_np),
+         skel.get_clavicle_left_surface_anchors_np),
         (mesh_r, xpbd_r, base_idx_r_np, base_idx_r, ligaments_r,
-         skel.get_pec_right_surface_anchors_np),
+         skel.get_clavicle_right_surface_anchors_np),
     ]:
         mesh.v_p.copy_from(mesh.v_p_ref)
         xpbd.v_v.fill(0)
@@ -238,8 +238,8 @@ while tirender.window.running:
     tirender.handle_input()
 
     skel.update()
-    ligaments_l.update_anchors(skel.get_pec_left_surface_anchors_np())
-    ligaments_r.update_anchors(skel.get_pec_right_surface_anchors_np())
+    ligaments_l.update_anchors(skel.get_clavicle_left_surface_anchors_np())
+    ligaments_r.update_anchors(skel.get_clavicle_right_surface_anchors_np())
 
     wall_now   = _time.time()
     wall_delta = wall_now - _wall_prev
