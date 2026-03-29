@@ -201,9 +201,9 @@ sim = {'paused': False, 'step_once': False, 'sim_rate': 1.0, 'frame': 0}
 def sim_reset():
     for mesh, xpbd, base_idx_np, base_idx_ti, lig, get_anchors in [
         (mesh_l, xpbd_l, base_idx_l_np, base_idx_l, ligaments_l,
-         skel.get_clavicle_left_surface_anchors_np),
+         skel.get_fascia_left_surface_anchors_np),
         (mesh_r, xpbd_r, base_idx_r_np, base_idx_r, ligaments_r,
-         skel.get_clavicle_right_surface_anchors_np),
+         skel.get_fascia_right_surface_anchors_np),
     ]:
         mesh.v_p.copy_from(mesh.v_p_ref)
         xpbd.v_v.fill(0)
@@ -238,8 +238,8 @@ while tirender.window.running:
     tirender.handle_input()
 
     skel.update()
-    ligaments_l.update_anchors(skel.get_clavicle_left_surface_anchors_np())
-    ligaments_r.update_anchors(skel.get_clavicle_right_surface_anchors_np())
+    ligaments_l.update_anchors(skel.get_fascia_left_surface_anchors_np())
+    ligaments_r.update_anchors(skel.get_fascia_right_surface_anchors_np())
 
     wall_now   = _time.time()
     wall_delta = wall_now - _wall_prev

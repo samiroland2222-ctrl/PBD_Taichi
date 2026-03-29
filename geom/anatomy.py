@@ -3,9 +3,12 @@ Skeletal proxy geometry for the breast simulation.
 
 Hierarchy:
   chest (root, static)
+  └── ribcage                 – static visual geometry attached to chest
   └── clavicle_left         – left clavicle, child of chest,
                               can pitch (up/down) and yaw (forward/back)
   └── clavicle_right        – right clavicle, same DOF
+  └── fascia_left           – clavipectoral fascia, deformable quad surface
+  └── fascia_right          – clavipectoral fascia, deformable quad surface
 
 A models each breast. The LEFT breast is positioned at ~x=+0.06 (patient's
 left when facing the camera, +x in our coordinate system).
@@ -15,7 +18,7 @@ Coordinate convention (matches breast mesh):
   y  – inferior(−)/superior(+)
   z  – posterior(0, chest wall) / anterior(+, outward)
 
-Cooper's ligaments run from the surface of the clavicles to the
+Cooper's ligaments run from the surface of the clavipectoral fascia to the
 outer surface of the breasts.
 """
 
@@ -161,6 +164,110 @@ def _bone_capsule_verts_local(length=0.15, radius=0.018,
 
 
 # ---------------------------------------------------------------------------
+# Ribcage procedural geometry
+# ---------------------------------------------------------------------------
+
+def _ribcage_verts_local(n_ribs=7, rib_radius=0.006,
+                          chest_width=0.18, chest_depth=0.10,
+                          rib_y_top=-0.01, rib_y_bottom=-0.15,
+                          segs=12):
+    """
+    Generate a simplified ribcage as a series of oval rib loops plus two
+    vertical sternum lines, all in local chest space.
+
+    Local origin = chest_pos (root of skeleton).
+    Ribs are horizontal ovals (XZ plane) stacked vertically along Y.
+
+    Returns verts (N,3), faces (M,3).
+    """
+    verts = []
+    faces = []
+
+    for ri in range(n_ribs):
+        t  = ri / max(n_ribs - 1, 1)               # 0..1 (top..bottom)
+        y  = rib_y_top + t * (rib_y_bottom - rib_y_top)
+        # Ribs taper laterally towards the bottom
+        w  = chest_width * (1.0 - 0.3 * t)
+        d  = chest_depth * (1.0 - 0.2 * t)
+
+        base = len(verts)
+        for si in range(segs):
+            angle = 2 * np.pi * si / segs
+            x = w * np.cos(angle)
+            z = d * (np.sin(angle) + 0.5)          # offset so ribs sit against chest wall (z≥0)
+            z = max(z, 0.0)
+            verts.append([x, y, z])
+
+        # Tube faces for the rib (thin cylinder along the rib curve)
+        # We just store the rib loop as line-like quads between consecutive verts;
+        # for rendering as a solid we connect adjacent segs into thin quads.
+        if ri > 0:
+            prev_base = base - segs
+            for si in range(segs):
+                a = prev_base + si
+                b = prev_base + (si + 1) % segs
+                c = base      + si
+                d_v = base    + (si + 1) % segs
+                faces += [[a, c, b], [b, c, d_v]]
+
+    verts = np.array(verts, dtype=np.float32)
+    faces = np.array(faces, dtype=np.int32) if len(faces) > 0 else np.zeros((0, 3), dtype=np.int32)
+    return verts, faces
+
+
+# ---------------------------------------------------------------------------
+# Clavipectoral fascia quad surface
+# ---------------------------------------------------------------------------
+
+def _fascia_verts_local(rows=6, cols=6,
+                         top_x0=0.02, top_x1=0.16,
+                         top_y=0.0,   top_z=0.02,
+                         bot_x0=0.01, bot_x1=0.14,
+                         bot_y=-0.08, bot_z=0.0):
+    """
+    Generate a (rows × cols) quad grid representing the clavipectoral fascia
+    for the LEFT side (positive x).
+
+    Row 0 = top edge  → tracks the clavicle (bound to clavicle frame each frame)
+    Row rows-1 = bottom edge → fixed to chest root (static)
+    Interior rows are linearly interpolated.
+
+    Returns:
+      verts_local (rows*cols, 3)  – reference positions (chest-space, unrotated)
+      faces       (M, 3)          – triangle indices
+      top_row_idx (cols,)         – vertex indices of the top row
+      bot_row_idx (cols,)         – vertex indices of the bottom row
+    """
+    verts = []
+    for ri in range(rows):
+        t = ri / (rows - 1)           # 0 = top, 1 = bottom
+        for ci in range(cols):
+            s = ci / (cols - 1)       # 0 = medial, 1 = lateral
+            # Interpolate top and bottom edges
+            top_x = top_x0 + s * (top_x1 - top_x0)
+            top_pt = np.array([top_x, top_y, top_z], dtype=np.float32)
+            bot_x  = bot_x0 + s * (bot_x1 - bot_x0)
+            bot_pt = np.array([bot_x, bot_y, bot_z], dtype=np.float32)
+            p = (1.0 - t) * top_pt + t * bot_pt
+            verts.append(p)
+
+    faces = []
+    for ri in range(rows - 1):
+        for ci in range(cols - 1):
+            a = ri * cols + ci
+            b = ri * cols + ci + 1
+            c = (ri + 1) * cols + ci
+            d = (ri + 1) * cols + ci + 1
+            faces += [[a, b, c], [b, d, c]]
+
+    verts = np.array(verts, dtype=np.float32)
+    faces = np.array(faces, dtype=np.int32)
+    top_row_idx = np.arange(0, cols, dtype=np.int32)
+    bot_row_idx = np.arange((rows - 1) * cols, rows * cols, dtype=np.int32)
+    return verts, faces, top_row_idx, bot_row_idx
+
+
+# ---------------------------------------------------------------------------
 # Skeleton
 # ---------------------------------------------------------------------------
 
@@ -193,6 +300,30 @@ class Skeleton:
         (self._clavicle_r_v_local, self._clavicle_r_f_np,
          self._clavicle_r_surf_idx) = _bone_capsule_verts_local()
 
+        # ── ribcage (static, attached to chest root) ───────────────────────
+        (self._ribcage_v_local,
+         self._ribcage_f_np) = _ribcage_verts_local()
+
+        # ── fascia local geometry (left side, positive x) ──────────────────
+        _FASCIA_ROWS = 6
+        _FASCIA_COLS = 6
+        (self._fascia_l_v_local, self._fascia_l_f_np,
+         self._fascia_l_top_idx, self._fascia_l_bot_idx) = _fascia_verts_local(
+             rows=_FASCIA_ROWS, cols=_FASCIA_COLS,
+             top_x0=0.02, top_x1=0.16,
+             top_y=0.0,   top_z=0.02,
+             bot_x0=0.01, bot_x1=0.14,
+             bot_y=-0.08, bot_z=0.0)
+
+        # Right fascia: mirror x (top_x1 → negative, etc.)
+        (self._fascia_r_v_local, self._fascia_r_f_np,
+         self._fascia_r_top_idx, self._fascia_r_bot_idx) = _fascia_verts_local(
+             rows=_FASCIA_ROWS, cols=_FASCIA_COLS,
+             top_x0=-0.02, top_x1=-0.16,
+             top_y=0.0,    top_z=0.02,
+             bot_x0=-0.01, bot_x1=-0.14,
+             bot_y=-0.08,  bot_z=0.0)
+
         # ── joint offsets from chest_pos ──────────────────────────────────
         # Left clavicle: local x=0 is the pivot (medial/sternum end).
         # Place it so the medial end is at world x ≈ 0.01 (just right of midline).
@@ -210,8 +341,27 @@ class Skeleton:
         self.clavicle_r_v,  self.clavicle_r_f  = _make_ti_mesh(
             self._clavicle_r_v_local,  self._clavicle_r_f_np)
 
+        # Ribcage (world = chest_pos + local, static)
+        ribcage_world = self._ribcage_v_local + self.chest_pos
+        self.ribcage_v, self.ribcage_f = _make_ti_mesh(
+            ribcage_world, self._ribcage_f_np)
+
+        # Fascia Taichi vertex fields (world space, updated each frame)
+        n_fascia_l = len(self._fascia_l_v_local)
+        n_fascia_r = len(self._fascia_r_v_local)
+        self.fascia_l_v = ti.Vector.field(3, dtype=ti.f32, shape=n_fascia_l)
+        self.fascia_l_f_ti = ti.field(dtype=ti.i32, shape=len(self._fascia_l_f_np) * 3)
+        self.fascia_l_f_ti.from_numpy(self._fascia_l_f_np.flatten().astype(np.int32))
+        self.fascia_r_v = ti.Vector.field(3, dtype=ti.f32, shape=n_fascia_r)
+        self.fascia_r_f_ti = ti.field(dtype=ti.i32, shape=len(self._fascia_r_f_np) * 3)
+        self.fascia_r_f_ti.from_numpy(self._fascia_r_f_np.flatten().astype(np.int32))
+
         # world-space cache of left clavicle surface verts (for anchors)
         self._clavicle_l_world = self._clavicle_l_v_local.copy()
+
+        # World-space caches for fascia
+        self._fascia_l_world = self._fascia_l_v_local + self.chest_pos
+        self._fascia_r_world = self._fascia_r_v_local + self.chest_pos
 
         self.update()
 
@@ -245,6 +395,56 @@ class Skeleton:
         self.clavicle_l_v.from_numpy(self._clavicle_l_world)
         self.clavicle_r_v.from_numpy(clavicle_r_world)
 
+        # ── update fascia ─────────────────────────────────────────────────
+        # Top edge of fascia tracks the clavicle local frame (same R + offset).
+        # Bottom edge is fixed to chest root (static).
+        # Interior rows are linearly interpolated (t=0 top, t=1 bottom).
+        self._fascia_l_world = self._update_fascia(
+            self._fascia_l_v_local,
+            self._fascia_l_top_idx, self._fascia_l_bot_idx,
+            R_l, self._clavicle_l_offset)
+        self.fascia_l_v.from_numpy(self._fascia_l_world.astype(np.float32))
+
+        # For right fascia: R_r acts on mirrored geometry (x already negative in local)
+        self._fascia_r_world = self._update_fascia(
+            self._fascia_r_v_local,
+            self._fascia_r_top_idx, self._fascia_r_bot_idx,
+            R_r, self._clavicle_r_offset)
+        self.fascia_r_v.from_numpy(self._fascia_r_world.astype(np.float32))
+
+    # ------------------------------------------------------------------
+    def _update_fascia(self, v_local, top_idx, bot_idx, R, offset):
+        """
+        Update fascia world positions.
+        Top row → transformed by clavicle rotation (same as clavicle bone).
+        Bottom row → fixed to chest root (no rotation, just chest_pos + local).
+        Interior rows → linearly blended by row-parameter t.
+        """
+        n_rows = 0
+        # Determine number of rows from the index arrays
+        # top_idx = row 0, bot_idx = row (n_rows-1)
+        n_cols = len(top_idx)
+        n_verts = len(v_local)
+        n_rows = n_verts // n_cols
+
+        world = np.empty_like(v_local)
+
+        # Compute top row (clavicle frame)
+        top_local = v_local[top_idx]
+        top_world = self._transform_verts(top_local, R, offset)
+
+        # Bottom row (static – chest root, no rotation)
+        bot_local = v_local[bot_idx]
+        bot_world = bot_local + self.chest_pos   # identity rotation
+
+        for ri in range(n_rows):
+            t = ri / (n_rows - 1)   # 0 = top, 1 = bottom
+            row_start = ri * n_cols
+            row_end   = row_start + n_cols
+            world[row_start:row_end] = (1.0 - t) * top_world + t * bot_world
+
+        return world
+
     # ------------------------------------------------------------------
     def get_clavicle_left_surface_anchors_np(self):
         """World-space positions of the left clavicle surface vertices."""
@@ -253,6 +453,14 @@ class Skeleton:
     def get_clavicle_right_surface_anchors_np(self):
         """World-space positions of the right clavicle surface vertices."""
         return self.clavicle_r_v.to_numpy()[self._clavicle_r_surf_idx]   # (n_surf, 3)
+
+    def get_fascia_left_surface_anchors_np(self):
+        """World-space positions of ALL left fascia vertices (used as ligament anchors)."""
+        return self._fascia_l_world.copy()   # (n_fascia, 3)
+
+    def get_fascia_right_surface_anchors_np(self):
+        """World-space positions of ALL right fascia vertices (used as ligament anchors)."""
+        return self._fascia_r_world.copy()   # (n_fascia, 3)
 
     # ------------------------------------------------------------------
     def reset_pose(self):
@@ -264,11 +472,24 @@ class Skeleton:
         self.update()
 
     # ------------------------------------------------------------------
-    def get_render_draws(self, clavicle=(0.60, 0.35, 0.35)):
+    def get_render_draws(self, clavicle=(0.60, 0.35, 0.35),
+                         ribcage=(0.55, 0.55, 0.65),
+                         fascia=(0.70, 0.80, 0.60)):
         def draw_clavicle_l(scene):
             scene.mesh(self.clavicle_l_v, self.clavicle_l_f,
                        color=clavicle, two_sided=True)
         def draw_clavicle_r(scene):
             scene.mesh(self.clavicle_r_v, self.clavicle_r_f,
                        color=clavicle, two_sided=True)
-        return [draw_clavicle_l, draw_clavicle_r]
+        def draw_ribcage(scene):
+            scene.mesh(self.ribcage_v, self.ribcage_f,
+                       color=ribcage, two_sided=True)
+        def draw_fascia_l(scene):
+            scene.mesh(self.fascia_l_v, self.fascia_l_f_ti,
+                       color=fascia, two_sided=True)
+        def draw_fascia_r(scene):
+            scene.mesh(self.fascia_r_v, self.fascia_r_f_ti,
+                       color=fascia, two_sided=True)
+        return [draw_clavicle_l, draw_clavicle_r,
+                draw_ribcage,
+                draw_fascia_l, draw_fascia_r]
