@@ -1,11 +1,13 @@
+import os
+
 import taichi as ti
 import numpy as np
 import math
 import random
 
 from cons import framework, deform3d, coopers
-from geom import gtet, obj, anatomy
-from utils import renderer, breast_mesh_generator
+from geom import gtet, obj, anatomy, gmesh
+from utils import renderer, breast_mesh_generator, parser
 
 ti.init(arch=ti.cpu, cpu_max_num_threads=1)
 
@@ -41,6 +43,38 @@ rng = random.Random(42)
 def _rand(center, spread):
     """Return center ± spread * U(-1, 1)."""
     return center + spread * (rng.random() * 2 - 1)
+
+# ribcage
+def _load_ribcage_mesh(scale=1.0, repose=(0, 0, 0)):
+    filepath = os.path.join(os.getcwd(), 'assets', 'mesh', 'ribcage_and_pelvis.obj')
+    verts, faces = parser.obj_parser(filepath)
+    verts = verts*scale
+    verts -= verts.mean(axis=0)  # center at origin
+
+    # filter to faces that are y>0
+    vert_mask = verts[:, 1] > 0
+    # faces is flat (shape [N*3]), reshape to [N, 3] for masking
+    faces = faces.reshape(-1, 3)
+    face_mask = vert_mask[faces].all(axis=1)
+    faces = faces[face_mask]
+    # flatten
+    faces = faces.flatten().astype(np.int32)
+
+    verts += repose
+
+    masked_verts = verts[vert_mask]
+
+    print(f"visible ribcage verts range: "
+          f"x=[{masked_verts[:, 0].min():.3f}, {masked_verts[:, 0].max():.3f}] "
+          f"y=[{masked_verts[:, 1].min():.3f}, {masked_verts[:, 1].max():.3f}] "
+          f"z=[{masked_verts[:, 2].min():.3f}, {masked_verts[:, 2].max():.3f}]")
+
+    return gmesh.TrianMesh(verts, faces, dim=3, rho=1.0)
+
+ribcage = _load_ribcage_mesh(
+    scale=1/50,
+    repose=(-0.003, -0.16, -0.08)
+)
 
 # Left breast parameters (slightly randomized)
 mesh_l = _make_breast_mesh(
@@ -160,6 +194,7 @@ tirender = renderer.TaichiRenderer3D("Deform 3D – Cooper's Ligaments",
                                      cameraLookat=(-0.4, -0.03, -0.17))
 
 skin = (0.85, 0.65, 0.55)
+tirender.add_scene_render_draw(ribcage.get_render_draw(color=(0.7, 0.7, 0.7), wireframe=True))
 tirender.add_scene_render_draw(mesh_l.get_render_draw(color=skin, wireframe=False))
 tirender.add_scene_render_draw(mesh_r.get_render_draw(color=skin, wireframe=False))
 for draw in skel.get_render_draws():
