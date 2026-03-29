@@ -3,8 +3,6 @@ Skeletal proxy geometry for the breast simulation.
 
 Hierarchy:
   chest (root, static)
-  └── clavipectoral_fascia  – broad band across upper chest, child of chest,
-                              no independent motion
   └── clavicle_left         – left clavicle, child of chest,
                               can pitch (up/down) and yaw (forward/back)
   └── clavicle_right        – right clavicle, same DOF
@@ -48,38 +46,6 @@ def _make_ti_mesh(verts_np, faces_np):
 # ---------------------------------------------------------------------------
 # Proxy mesh generators
 # ---------------------------------------------------------------------------
-
-def _fascia_verts_local():
-    """
-    Clavipectoral fascia: a broad concave band ~20 cm wide, 6 cm tall,
-    curving gently around the chest wall.  Local origin = band centre.
-    """
-    cols, rows  = 9, 5
-    width       = 0.20    # m, total width across sternum
-    height      = 0.06    # m
-    curve_depth = 0.012   # z concavity (wraps chest)
-
-    verts = []
-    for r in range(rows):
-        tv = r / (rows - 1)
-        for c in range(cols):
-            tu = c / (cols - 1) - 0.5
-            x  = tu * width
-            y  = (0.5 - tv) * height
-            z  = -curve_depth * (1.0 - 4.0 * tu * tu)
-            verts.append([x, y, z])
-
-    faces = []
-    for r in range(rows - 1):
-        for c in range(cols - 1):
-            i0 = r * cols + c
-            i1 = i0 + 1
-            i2 = i0 + cols
-            i3 = i2 + 1
-            faces += [[i0, i2, i1], [i1, i2, i3]]
-
-    return np.array(verts, dtype=np.float32), np.array(faces, dtype=np.int32)
-
 
 def _bone_capsule_verts_local(length=0.15, radius=0.018,
                                rings=8, segs=10):
@@ -221,18 +187,13 @@ class Skeleton:
         self.clavicle_right_pitch = 0.0
         self.clavicle_right_yaw   = 0.0
 
-        # ── local geometry ────────────────────────────────────────────────
-        self._fascia_v_local, self._fascia_f_np = _fascia_verts_local()
-
+        # ── local geometray ────────────────────────────────────────────────
         (self._clavicle_l_v_local, self._clavicle_l_f_np,
          self._clavicle_l_surf_idx) = _bone_capsule_verts_local()
         (self._clavicle_r_v_local, self._clavicle_r_f_np,
          self._clavicle_r_surf_idx) = _bone_capsule_verts_local()
 
         # ── joint offsets from chest_pos ──────────────────────────────────
-        # fascia: wide band across upper chest at chest wall
-        self._fascia_offset  = np.array([0.0,  -0.01,  0.005], dtype=np.float32)
-
         # Left clavicle: local x=0 is the pivot (medial/sternum end).
         # Place it so the medial end is at world x ≈ 0.01 (just right of midline).
         # offset is added to chest_pos=(0, 0.13, 0), so world medial end =
@@ -244,8 +205,6 @@ class Skeleton:
         self._clavicle_r_offset   = np.array([-0.02, -0.01, 0.02], dtype=np.float32)
 
         # ── Taichi fields ─────────────────────────────────────────────────
-        self.fascia_v, self.fascia_f = _make_ti_mesh(
-            self._fascia_v_local, self._fascia_f_np)
         self.clavicle_l_v,  self.clavicle_l_f  = _make_ti_mesh(
             self._clavicle_l_v_local,  self._clavicle_l_f_np)
         self.clavicle_r_v,  self.clavicle_r_f  = _make_ti_mesh(
@@ -262,9 +221,6 @@ class Skeleton:
 
     def update(self):
         R_id = np.eye(3, dtype=np.float32)
-        self.fascia_v.from_numpy(
-            self._transform_verts(self._fascia_v_local, R_id,
-                                  self._fascia_offset))
 
         # Long axis is +x (medial→lateral).
         # Pitch = tilt lateral end up/down  → rot around Z.
@@ -308,15 +264,11 @@ class Skeleton:
         self.update()
 
     # ------------------------------------------------------------------
-    def get_render_draws(self, fascia_color=(0.85, 0.80, 0.95),
-                         claivcle_color=(0.60, 0.35, 0.35)):
-        def draw_fascia(scene):
-            scene.mesh(self.fascia_v, self.fascia_f,
-                       color=fascia_color, two_sided=True)
+    def get_render_draws(self, clavicle=(0.60, 0.35, 0.35)):
         def draw_clavicle_l(scene):
             scene.mesh(self.clavicle_l_v, self.clavicle_l_f,
-                       color=claivcle_color, two_sided=True)
+                       color=clavicle, two_sided=True)
         def draw_clavicle_r(scene):
             scene.mesh(self.clavicle_r_v, self.clavicle_r_f,
-                       color=claivcle_color, two_sided=True)
-        return [draw_fascia, draw_clavicle_l, draw_clavicle_r]
+                       color=clavicle, two_sided=True)
+        return [draw_clavicle_l, draw_clavicle_r]

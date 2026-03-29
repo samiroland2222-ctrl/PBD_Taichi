@@ -1,21 +1,16 @@
 """
 Cooper's Ligaments constraint for the breast simulation.
 
-Phase 1 – Simple anchor springs
+Already implemented:  Simple anchor springs (complete)
 ────────────────────────────────
 Each ligament is a distance spring between:
-  • a fixed world-space anchor point on the clavicle and/or clavicular fascia
+  • a fixed world-space anchor point on the corresponding clavicle
   • a surface vertex of the breast mesh
 
 The spring is one-sided when rest_length is used as an upper bound
 (only pulls, never pushes), which mimics the collagen strand behaviour:
 ligaments resist elongation but offer no compression resistance.
 
-Phase 2 – Branching (planned)
-──────────────────────────────
-Each fascia anchor fans out to a small cluster of nearby breast vertices
-with weights that fall off with distance, modelling the dendritic
-branching described in the anatomical literature.
 """
 
 import taichi as ti
