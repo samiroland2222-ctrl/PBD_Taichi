@@ -1,6 +1,5 @@
 """
 Unit tests for geom/anatomy.py covering:
-  - Phase 1: Ribcage geometry generation and world-space transform
   - Phase 2: Clavipectoral fascia surface generation, kinematic binding,
              and anchor getters
 """
@@ -13,68 +12,9 @@ ti.init(arch=ti.cpu, cpu_max_num_threads=1)
 
 from geom import anatomy
 from geom.anatomy import (
-    _ribcage_verts_local,
     _fascia_verts_local,
     Skeleton,
 )
-
-
-# ───────────────────────────────────────────────────────────────────────────
-# Phase 1 – Ribcage
-# ───────────────────────────────────────────────────────────────────────────
-
-class TestRibcageGeometry:
-    """_ribcage_verts_local returns valid geometry."""
-
-    def test_returns_arrays(self):
-        verts, faces = _ribcage_verts_local()
-        assert isinstance(verts, np.ndarray)
-        assert isinstance(faces, np.ndarray)
-
-    def test_vertex_shape(self):
-        verts, _ = _ribcage_verts_local()
-        assert verts.ndim == 2
-        assert verts.shape[1] == 3
-        # 12 ribs × 2 sides, each with its own tube mesh — just check non-empty
-        assert len(verts) > 0
-
-    def test_face_shape(self):
-        _, faces = _ribcage_verts_local()
-        assert faces.shape[1] == 3
-        assert len(faces) > 0
-
-    def test_z_nonpositive_with_tube_tolerance(self):
-        """After kyphosis tilt the upper sternal ends protrude slightly anteriorly.
-        The max anterior protrusion is sin(kyphosis) * y_range + tube_radius."""
-        verts, _ = _ribcage_verts_local()
-        max_tube_r = max(p[8] for p in anatomy._RIB_PARAMS)
-        # kyphosis of 15° over y_range ≈ 0.20m gives max z ≈ sin(15°)*0.10 ≈ 0.026
-        kyphosis_max_z = np.sin(np.deg2rad(15.0)) * 0.20 + max_tube_r
-        assert np.all(verts[:, 2] <= kyphosis_max_z + 1e-4), \
-            f"Some ribcage verts protrude more than expected anteriorly (max z={verts[:,2].max():.4f})"
-
-    def test_skeleton_ribcage_world_transform(self):
-        """Ribcage world positions = local + chest_pos."""
-        chest_pos = np.array([0.0, 0.08, 0.0], dtype=np.float32)
-        skel = Skeleton(chest_pos=chest_pos.tolist())
-
-        local_v, _ = _ribcage_verts_local()
-        expected_world = local_v + chest_pos
-
-        actual_world = skel.ribcage_v.to_numpy()
-        np.testing.assert_allclose(actual_world, expected_world, atol=1e-5,
-                                   err_msg="Ribcage world verts != local + chest_pos")
-
-    def test_skeleton_ribcage_static_after_clavicle_move(self):
-        """Moving clavicle pitch/yaw must NOT change the ribcage positions."""
-        skel = Skeleton()
-        before = skel.ribcage_v.to_numpy().copy()
-        skel.clavicle_left_pitch = 0.4
-        skel.clavicle_right_yaw  = 0.3
-        skel.update()
-        after = skel.ribcage_v.to_numpy()
-        np.testing.assert_allclose(before, after, atol=1e-6,
-                                   err_msg="Ribcage should be static – unchanged by clavicle rotation")
 
 
 # ───────────────────────────────────────────────────────────────────────────

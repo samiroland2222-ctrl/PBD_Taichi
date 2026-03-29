@@ -3,7 +3,6 @@ Skeletal proxy geometry for the breast simulation.
 
 Hierarchy:
   chest (root, static)
-  └── ribcage                 – static visual geometry attached to chest
   └── clavicle_left         – left clavicle, child of chest,
                               can pitch (up/down) and yaw (forward/back)
   └── clavicle_right        – right clavicle, same DOF
@@ -162,346 +161,6 @@ def _bone_capsule_verts_local(length=0.136, radius=0.007,
 
     return verts, faces, lateral_surf_idx
 
-
-# ---------------------------------------------------------------------------
-# Ribcage procedural geometry  –  anatomically accurate female skeleton
-# ---------------------------------------------------------------------------
-#
-# Anthropometric sources:
-#   • Clauser et al. NASA CR-1537 (1969) – female surface anthropometry
-#   • Gayzik et al. J Biomech 2012 – average female thorax geometry
-#   • Gray's Anatomy (41st ed.) – rib geometry and sternal attachments
-#   • Loveday & Evans Clin Radiol 1989 – female thorax CT measurements
-#
-# Average female skeleton (~162 cm stature):
-#   Thoracic inlet (T1/R1) y ≈ +0.04 m  (above our chest_pos)
-#   R7 costal cartilage / xiphoid  y ≈ -0.14 m
-#   Bi-costal width at R1  ≈ 110 mm (half = 55 mm per side)
-#   Bi-costal width at R7  ≈ 230 mm (half = 115 mm per side)
-#   Max AP thoracic depth (at ~R5)  ≈ 175 mm (half-depth ≈ 88 mm)
-#
-# Coordinate frame (local, origin = chest_pos):
-#   x  medial(0) → lateral(+)   left side only; right is mirrored
-#   y  inferior(−) → superior(+)
-#   z  posterior(−) ← chest wall(0) → anterior(+)
-#
-# Each rib is modelled as a tube swept along a 3-D parametric curve:
-#   • The curve starts at the costo-sternal joint (medial, x≈0, z≈0)
-#   • sweeps laterally, posteriorly, and slightly inferiorly following
-#     the natural rib angle
-#   • ends at a costovertebral joint position (posterior, z ≈ -depth)
-#
-# Ribs 1-7 are the "true" ribs whose costal cartilages attach to the sternum.
-# Ribs 8-10 attach via shared costal cartilage (not individually to sternum).
-# Ribs 11-12 are floating – they end freely, lateral and slightly inferior.
-#
-# We model LEFT-side ribs only; the caller mirrors for the right side.
-
-# Per-rib parameters for the LEFT side.  All dimensions in metres.
-#
-#   x_start   – x of the ANTERIOR (sternal/chondral) end of the rib bone
-#               R1-R7: x≈0 (sternal attachment)
-#               R8-R10: x≈0.02-0.04 (attach to costal margin of R7, not sternum)
-#               R11-R12: x≈0.06-0.08 (floating, no anterior attachment)
-#   y_start   – y of that anterior end (local, rel. to chest_pos)
-#   x_lateral – x of the lateral-most point of the rib (widest point)
-#   ap_depth  – full AP depth of the thorax at this rib level (z = -ap_depth
-#               at the costovertebral joint on the spine)
-#   y_cv      – y of the costovertebral joint (usually slightly below y_start
-#               because ribs slope inferiorly from sternum to spine)
-#   tube_r    – tube cross-section radius
-#   n_pts     – number of curve sample points
-
-_RIB_PARAMS = [
-    # idx  x_start  y_start  x_lat   x_angle  z_angle  ap_depth  y_cv    tube_r  n_ant n_post
-    #
-    # z_angle = z of the rib ANGLE (angulus costae).
-    # Anatomically the rib angle is the sharpest point of posterior curvature,
-    # located ~60-65% laterally.  For a female thorax:
-    #   R1:  rib angle ~30mm posterior to chest wall
-    #   R5:  rib angle ~70mm posterior  (deepest)
-    #   R12: rib angle ~35mm posterior
-    #
-    # ap_depth = z of costovertebral joint (where rib meets spine).
-    # Spine sits a further ~50mm behind this.
-    #
-    # R1
-    (  0,   0.000,   0.035,  0.060,   0.050,  -0.030,   0.055,   0.028,  0.006,  10, 10),
-    # R2
-    (  1,   0.000,   0.018,  0.080,   0.065,  -0.045,   0.072,   0.007,  0.006,  12, 12),
-    # R3
-    (  2,   0.000,   0.000,  0.098,   0.078,  -0.058,   0.083,  -0.010,  0.006,  14, 12),
-    # R4
-    (  3,   0.000,  -0.018,  0.112,   0.088,  -0.065,   0.090,  -0.030,  0.006,  14, 14),
-    # R5  (widest, deepest rib angle)
-    (  4,   0.000,  -0.036,  0.120,   0.094,  -0.070,   0.095,  -0.052,  0.006,  14, 14),
-    # R6
-    (  5,   0.000,  -0.056,  0.122,   0.096,  -0.068,   0.092,  -0.074,  0.006,  14, 14),
-    # R7
-    (  6,   0.000,  -0.076,  0.118,   0.092,  -0.063,   0.086,  -0.096,  0.006,  12, 14),
-    # R8  – false rib
-    (  7,   0.030,  -0.090,  0.114,   0.096,  -0.057,   0.080,  -0.114,  0.005,  12, 12),
-    # R9
-    (  8,   0.045,  -0.104,  0.108,   0.094,  -0.050,   0.073,  -0.130,  0.005,  10, 12),
-    # R10
-    (  9,   0.060,  -0.116,  0.098,   0.088,  -0.043,   0.064,  -0.144,  0.005,  10, 10),
-    # R11  floating
-    ( 10,   0.075,  -0.126,  0.084,   0.080,  -0.037,   0.054,  -0.154,  0.004,   8, 10),
-    # R12  floating, shortest
-    ( 11,   0.085,  -0.134,  0.066,   0.062,  -0.030,   0.042,  -0.160,  0.004,   8,  8),
-]
-
-
-def _rib_curve(x_start, y_start, x_lateral, x_angle, z_angle,
-               ap_depth, y_cv, n_pts_ant, n_pts_post):
-    """
-    Two-segment rib centreline joined at the rib ANGLE (angulus costae).
-
-    Segment 1 – Anterior: sternum → rib angle
-      Departs laterally (+x), curves gently posteriorly.
-      Produces the flatter anterior/lateral face of the rib.
-
-    Segment 2 – Posterior: rib angle → costovertebral joint
-      Sweeps sharply posteriorly and medially back to x=0 at the spine.
-      Produces the tighter, more curved posterior section.
-
-    C1-continuous at the join: the outgoing tangent of seg2 mirrors the
-    incoming tangent of seg1, giving a smooth curve with the characteristic
-    D/kidney shape of a real rib when viewed from above.
-    """
-    y_angle = y_start + (y_cv - y_start) * 0.35   # rib angle sits ~35% of the way down
-
-    # ── Segment 1: anterior arc (sternum → rib angle) ─────────────────────
-    q0 = np.array([x_start,   y_start,  0.0],     dtype=np.float64)
-    q2 = np.array([x_angle,   y_angle,  z_angle],  dtype=np.float64)
-
-    # Control point: overshoot laterally so the quadratic arc actually
-    # reaches x_lateral as its peak.
-    # z at 0.50 of z_angle gives the anterior arc enough posterior curvature
-    # to produce the correct barrel shape when viewed from above.
-    q1 = np.array([x_start + (x_lateral - x_start) * 1.55,
-                   y_start + (y_angle - y_start) * 0.30,
-                   z_angle * 0.50],               # half-way to rib angle depth
-                  dtype=np.float64)
-
-    t1 = np.linspace(0.0, 1.0, n_pts_ant)[:, None]
-    seg1 = (1-t1)**2 * q0 + 2*(1-t1)*t1 * q1 + t1**2 * q2
-
-    # ── Segment 2: posterior arc (rib angle → costovertebral joint) ────────
-    r0 = q2   # same join point
-    r2 = np.array([0.0,   y_cv,  -ap_depth], dtype=np.float64)
-
-    # C1 continuity: incoming tangent at q2 from seg1 = 2*(q2 - q1).
-    # Outgoing tangent of seg2 at r0 = 2*(r1 - r0).
-    # For C1: r1 = r0 + (r0 - q1)  →  mirrors q1 across the rib angle.
-    r1_c1 = r0 + (r0 - q1)
-
-    # Blend r1_c1 toward the spine to get the tighter posterior sweep:
-    # pull x toward 0, deepen z further, keep y interpolated.
-    r1 = np.array([r1_c1[0] * 0.45,
-                   r0[1] + (y_cv - r0[1]) * 0.45,
-                   r0[2] + (-ap_depth - r0[2]) * 0.60],
-                  dtype=np.float64)
-
-    t2 = np.linspace(0.0, 1.0, n_pts_post)[:, None]
-    seg2 = (1-t2)**2 * r0 + 2*(1-t2)*t2 * r1 + t2**2 * r2
-
-    # Concatenate, dropping the duplicated rib-angle point at the join
-    curve = np.concatenate([seg1, seg2[1:]], axis=0)
-    return curve.astype(np.float32)
-
-
-def _tube_mesh_along_curve(curve, radius, segs=8):
-    """
-    Sweep a circular cross-section of given radius along a 3-D polyline.
-    Returns verts (N,3), faces (M,3).
-    """
-    n_pts = len(curve)
-    verts = []
-    faces = []
-
-    # Build a local frame at each point using the Frenet-Serret method
-    # (parallel transport to avoid twisting).
-    tangents = np.zeros_like(curve)
-    tangents[:-1] = curve[1:] - curve[:-1]
-    tangents[-1]  = tangents[-2]
-    norms = np.linalg.norm(tangents, axis=1, keepdims=True)
-    norms = np.where(norms < 1e-10, 1.0, norms)
-    tangents = tangents / norms
-
-    # Seed the first normal perpendicular to the first tangent
-    seed = np.array([0.0, 0.0, 1.0])
-    if abs(np.dot(tangents[0], seed)) > 0.9:
-        seed = np.array([0.0, 1.0, 0.0])
-    normal = seed - np.dot(seed, tangents[0]) * tangents[0]
-    normal /= np.linalg.norm(normal)
-
-    normals  = [normal]
-    binormals = [np.cross(tangents[0], normal)]
-
-    for i in range(1, n_pts):
-        n_prev = normals[-1]
-        t_cur  = tangents[i]
-        # Parallel transport
-        n_cur = n_prev - np.dot(n_prev, t_cur) * t_cur
-        ln = np.linalg.norm(n_cur)
-        if ln < 1e-10:
-            n_cur = normals[-1]
-        else:
-            n_cur /= ln
-        normals.append(n_cur)
-        binormals.append(np.cross(t_cur, n_cur))
-
-    for i in range(n_pts):
-        n  = normals[i]
-        b  = binormals[i]
-        c  = curve[i]
-        base = len(verts)
-        for si in range(segs):
-            angle = 2 * np.pi * si / segs
-            verts.append(c + radius * (np.cos(angle) * n + np.sin(angle) * b))
-
-        if i > 0:
-            prev = base - segs
-            for si in range(segs):
-                a  = prev + si
-                bv = prev + (si + 1) % segs
-                cv = base + si
-                dv = base + (si + 1) % segs
-                faces += [[a, cv, bv], [bv, cv, dv]]
-
-    # End caps
-    def _cap(ring_start, tip, outward):
-        for si in range(segs):
-            a = ring_start + si
-            b = ring_start + (si + 1) % segs
-            if outward:
-                faces.append([a, tip, b])
-            else:
-                faces.append([a, b, tip])
-
-    tip0 = len(verts);  verts.append(curve[0])
-    _cap(0, tip0, outward=False)
-    tip1 = len(verts);  verts.append(curve[-1])
-    _cap((n_pts - 1) * segs, tip1, outward=True)
-
-    return np.array(verts, dtype=np.float32), np.array(faces, dtype=np.int32)
-
-
-def _spine_verts_local():
-    """
-    Approximate thoracic vertebral column as a tapered capsule tube
-    running along the posterior midline (x=0) from T1 to T12.
-
-    The vertebral bodies sit ~50mm posterior to the posterior rib angle.
-    Rib angle z = -ap_depth; spine z = -ap_depth - 0.050.
-    The thoracic spine has a natural kyphotic curve (convex posteriorly),
-    so z_spine is slightly deeper at mid-thorax than at top/bottom.
-    """
-    # _RIB_PARAMS columns: idx,x_start,y_start,x_lat,x_angle,z_angle,ap_depth,y_cv,tube_r,n_ant,n_post
-    VERT_OFFSET = 0.050   # vertebral bodies ~50mm behind rib angle
-
-    n_verts_col = 14
-    segs = 8
-    spine_r = 0.014   # ~28mm vertebral body radius
-
-    n_ribs = len(_RIB_PARAMS)
-    rib_y_cv    = np.array([p[7] for p in _RIB_PARAMS], dtype=np.float64)
-    rib_ap      = np.array([p[6] for p in _RIB_PARAMS], dtype=np.float64)
-    rib_z_angle = -rib_ap
-    rib_z_spine = rib_z_angle - VERT_OFFSET
-
-    verts = []
-    faces = []
-
-    for vi in range(n_verts_col):
-        t = vi / (n_verts_col - 1)
-        # Interpolate along the rib sequence
-        rib_t = t * (n_ribs - 1)
-        ri0 = int(np.floor(rib_t)); ri1 = min(ri0 + 1, n_ribs - 1)
-        alpha = rib_t - ri0
-        y = rib_y_cv[ri0] * (1 - alpha) + rib_y_cv[ri1] * alpha
-        z = rib_z_spine[ri0] * (1 - alpha) + rib_z_spine[ri1] * alpha
-        r = spine_r * (1.0 - 0.10 * t)
-
-        base = len(verts)
-        for si in range(segs):
-            angle = 2 * np.pi * si / segs
-            verts.append([r * np.cos(angle), y, z + r * np.sin(angle)])
-        if vi > 0:
-            prev = base - segs
-            for si in range(segs):
-                a  = prev + si;        bv = prev + (si+1) % segs
-                cv = base + si;        dv = base + (si+1) % segs
-                faces += [[a, cv, bv], [bv, cv, dv]]
-
-    # end caps
-    y0, z0 = rib_y_cv[0],  rib_z_spine[0]
-    y1, z1 = rib_y_cv[-1], rib_z_spine[-1]
-    tip0 = len(verts); verts.append([0.0, y0, z0])
-    for si in range(segs):
-        faces.append([si, (si+1) % segs, tip0])
-    tip1 = len(verts); verts.append([0.0, y1, z1])
-    last = (n_verts_col - 1) * segs
-    for si in range(segs):
-        faces.append([last + si, tip1, last + (si+1) % segs])
-
-    return np.array(verts, dtype=np.float32), np.array(faces, dtype=np.int32)
-
-
-def _ribcage_verts_local():
-    """
-    Build a full left+right ribcage from 12 individually modelled rib bones
-    plus the thoracic spine, using average female anthropometry.
-
-    Returns verts (N,3), faces (M,3)  in local chest space
-    (origin = chest_pos, z=0 = anterior chest wall).
-    """
-    all_verts = []
-    all_faces = []
-
-    for (_idx, x_start, y_start, x_lateral, x_angle, z_angle,
-         ap_depth, y_cv, tube_r, n_ant, n_post) in _RIB_PARAMS:
-
-        curve_l = _rib_curve(x_start, y_start, x_lateral, x_angle, z_angle,
-                             ap_depth, y_cv, n_ant, n_post)
-        v_l, f_l = _tube_mesh_along_curve(curve_l, radius=tube_r, segs=8)
-
-        # Mirror for right side: flip x
-        curve_r = curve_l.copy(); curve_r[:, 0] *= -1
-        v_r, f_r = _tube_mesh_along_curve(curve_r, radius=tube_r, segs=8)
-        # Flip winding on right side (mirroring reverses handedness)
-        f_r = f_r[:, ::-1]
-
-        off_l = sum(len(v) for v in all_verts)
-        all_verts.append(v_l);  all_faces.append(f_l + off_l)
-
-        off_r = sum(len(v) for v in all_verts)
-        all_verts.append(v_r);  all_faces.append(f_r + off_r)
-
-    # Vertebral column
-    v_sp, f_sp = _spine_verts_local()
-    off_sp = sum(len(v) for v in all_verts)
-    all_verts.append(v_sp);  all_faces.append(f_sp + off_sp)
-
-    verts = np.concatenate(all_verts, axis=0).astype(np.float32)
-    faces = np.concatenate(all_faces, axis=0).astype(np.int32)
-
-    # ── Thoracic kyphosis: tilt the whole ribcage ~15° about x, pivoting at
-    # mid-thorax (y≈-0.06 in local coords).  Negative angle: upper sternum
-    # tilts anteriorly (+z), lower thorax tilts posteriorly (−z).
-    kyphosis_deg = -15.0
-    a = np.deg2rad(kyphosis_deg)
-    c, s = np.cos(a), np.sin(a)
-    Rx = np.array([[1, 0, 0], [0, c, -s], [0, s, c]], dtype=np.float32)
-    pivot_y = -0.06  # mid-thorax y
-    verts[:, 1] -= pivot_y
-    verts = (verts @ Rx.T)
-    verts[:, 1] += pivot_y
-
-    return verts, faces
-
-
 # ---------------------------------------------------------------------------
 # Clavipectoral fascia quad surface
 # ---------------------------------------------------------------------------
@@ -586,10 +245,6 @@ class Skeleton:
         (self._clavicle_r_v_local, self._clavicle_r_f_np,
          self._clavicle_r_surf_idx) = _bone_capsule_verts_local()
 
-        # ── ribcage (static, attached to chest root) ───────────────────────
-        (self._ribcage_v_local,
-         self._ribcage_f_np) = _ribcage_verts_local()
-
         # ── fascia local geometry (left side, positive x) ──────────────────
         _FASCIA_ROWS = 6
         _FASCIA_COLS = 6
@@ -627,11 +282,6 @@ class Skeleton:
             self._clavicle_l_v_local,  self._clavicle_l_f_np)
         self.clavicle_r_v,  self.clavicle_r_f  = _make_ti_mesh(
             self._clavicle_r_v_local,  self._clavicle_r_f_np)
-
-        # Ribcage (world = chest_pos + local, static)
-        ribcage_world = self._ribcage_v_local + self.chest_pos
-        self.ribcage_v, self.ribcage_f = _make_ti_mesh(
-            ribcage_world, self._ribcage_f_np)
 
         # Fascia Taichi vertex fields (world space, updated each frame)
         n_fascia_l = len(self._fascia_l_v_local)
@@ -768,9 +418,6 @@ class Skeleton:
         def draw_clavicle_r(scene):
             scene.mesh(self.clavicle_r_v, self.clavicle_r_f,
                        color=clavicle, two_sided=True)
-        def draw_ribcage(scene):
-            scene.mesh(self.ribcage_v, self.ribcage_f,
-                       color=ribcage, two_sided=True)
         def draw_fascia_l(scene):
             scene.mesh(self.fascia_l_v, self.fascia_l_f_ti,
                        color=fascia, two_sided=True)
@@ -778,5 +425,4 @@ class Skeleton:
             scene.mesh(self.fascia_r_v, self.fascia_r_f_ti,
                        color=fascia, two_sided=True)
         return [draw_clavicle_l, draw_clavicle_r,
-                draw_ribcage,
                 draw_fascia_l, draw_fascia_r]
