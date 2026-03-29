@@ -17,7 +17,7 @@ ti.init(arch=ti.cpu, cpu_max_num_threads=1)
 #               reflecting the loaded verts through x=0.
 # Parameters are slightly randomized per side for naturalistic asymmetry.
 
-def _make_breast_mesh(rho=1.0, scale=1.0, repose=(0.08, 0.0, 0.0),
+def _make_breast_mesh(rho=1.0, scale=1.0, repose=(0.08, 0.0, 0.0), rotate=(0.0, 0.0, 0.0),
                       radius=0.07, height=0.06, k=0.7, target_tets=300):
     """Generate a TetMesh directly from the procedural breast mesh generator."""
     coords, node_tags, tet_node_tags, _ = breast_mesh_generator.generate_breast_msh(
@@ -26,6 +26,26 @@ def _make_breast_mesh(rho=1.0, scale=1.0, repose=(0.08, 0.0, 0.0),
     # node_tags are 1-indexed; build a mapping to 0-indexed positions
     tag_to_idx = {tag: i for i, tag in enumerate(node_tags)}
     v = coords.astype(np.float32)
+
+    z_min, z_max = v[:, 2].min(), v[:, 2].max()
+    base_idx = np.where(v[:, 2] <= z_min + (z_max - z_min) * 0.02)[0].astype(np.int32)
+
+    # rotate around x, y, z axes by rotate=(rx, ry, rz) in radians
+    rx, ry, rz = rotate
+    cosx, sinx = math.cos(rx), math.sin(rx)
+    cosy, siny = math.cos(ry), math.sin(ry)
+    cosz, sinz = math.cos(rz), math.sin(rz)
+    rot_x = np.array([[1, 0, 0],
+                      [0, cosx, -sinx],
+                      [0, sinx, cosx]])
+    rot_y = np.array([[cosy, 0, siny],
+                      [0, 1, 0],
+                      [-siny, 0, cosy]])
+    rot_z = np.array([[cosz, -sinz, 0],
+                      [sinz, cosz, 0],
+                      [0, 0, 1]])
+    rot = rot_z @ rot_y @ rot_x
+    v = v @ rot.T
 
     # tet_node_tags are 1-indexed node tags → convert to 0-indexed
     tets = np.array([[tag_to_idx[n] for n in row] for row in tet_node_tags],
@@ -36,7 +56,7 @@ def _make_breast_mesh(rho=1.0, scale=1.0, repose=(0.08, 0.0, 0.0),
     f_flat = f.flatten().astype(np.int32)
 
     return gtet.TetMesh(v=v, t=t_flat, f=f_flat,
-                        rho=rho, scale=scale, repose=repose)
+                        rho=rho, scale=scale, repose=repose), base_idx
 
 rng = random.Random(42)
 
@@ -73,12 +93,12 @@ def _load_ribcage_mesh(scale=1.0, repose=(0, 0, 0)):
 
 ribcage = _load_ribcage_mesh(
     scale=1/50,
-    repose=(-0.003, -0.16, -0.08)
+    repose=(-0.003, -0.14, -0.08)
 )
 
 # Left breast parameters (slightly randomized)
-mesh_l = _make_breast_mesh(
-    rho=1.0, scale=1.0, repose=(0.08, 0.0, 0.0),
+mesh_l, base_idx_l_np = _make_breast_mesh(
+    rho=1.0, scale=1.0, repose=(0.07, 0.0, 0.0), rotate=(-0.2, 0.5, 0.0),
     radius=_rand(0.070, 0.004),
     height=_rand(0.060, 0.004),
     k=_rand(0.70, 0.05),
@@ -86,8 +106,8 @@ mesh_l = _make_breast_mesh(
 )
 
 # Right breast parameters (independently randomized)
-mesh_r = _make_breast_mesh(
-    rho=1.0, scale=1.0, repose=(0.08, 0.0, 0.0),
+mesh_r, base_idx_r_np = _make_breast_mesh(
+    rho=1.0, scale=1.0, repose=(0.07, 0.0, 0.0), rotate=(-0.2, 0.5, 0.0),
     radius=_rand(0.070, 0.004),
     height=_rand(0.060, 0.004),
     k=_rand(0.70, 0.05),
@@ -149,18 +169,15 @@ xpbd_r.add_collision(box3d.collision)
 xpbd_r.init_rest_status()
 
 # ── Pin base (z ≈ 0) – both breasts ──────────────────────────────────────────
-def _make_base_pin(mesh):
-    v = mesh.v_p_ref.to_numpy()
-    z_min, z_max = v[:, 2].min(), v[:, 2].max()
-    idx_np = np.where(v[:, 2] <= z_min + (z_max - z_min) * 0.02)[0].astype(np.int32)
+def _make_base_pin(mesh, idx_np):
     idx_ti = ti.field(dtype=ti.i32, shape=len(idx_np))
     idx_ti.from_numpy(idx_np)
     mesh.set_fixed_point(len(idx_np), idx_ti)
-    return idx_np, idx_ti
+    return idx_ti
 
 verts_l_np,  verts_r_np  = mesh_l.v_p_ref.to_numpy(), mesh_r.v_p_ref.to_numpy()
-base_idx_l_np, base_idx_l = _make_base_pin(mesh_l)
-base_idx_r_np, base_idx_r = _make_base_pin(mesh_r)
+base_idx_l = _make_base_pin(mesh_l, base_idx_l_np)
+base_idx_r = _make_base_pin(mesh_r, base_idx_r_np)
 
 # ── Skeleton ──────────────────────────────────────────────────────────────────
 skel = anatomy.Skeleton()
@@ -194,7 +211,7 @@ tirender = renderer.TaichiRenderer3D("Deform 3D – Cooper's Ligaments",
                                      cameraLookat=(-0.4, -0.03, -0.17))
 
 skin = (0.85, 0.65, 0.55)
-tirender.add_scene_render_draw(ribcage.get_render_draw(color=(0.7, 0.7, 0.7), wireframe=True))
+tirender.add_scene_render_draw(ribcage.get_render_draw(color=(0.7, 0.7, 0.5), wireframe=False))
 tirender.add_scene_render_draw(mesh_l.get_render_draw(color=skin, wireframe=False))
 tirender.add_scene_render_draw(mesh_r.get_render_draw(color=skin, wireframe=False))
 for draw in skel.get_render_draws():
