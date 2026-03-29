@@ -188,9 +188,9 @@ def gui_draw(gui):
     gui.text(f"  alpha={ligaments_l.alpha:.2e}  n_l={ligaments_l.n}  n_r={ligaments_r.n}")
 
     gui.text("── Clavicle joints ──")
-    skel.clavicle_left_pitch  = gui.slider_float("L pitch", skel.clavicle_left_pitch, -0.5, 0.5)
+    skel.clavicle_left_pitch  = gui.slider_float("L pitch", skel.clavicle_left_pitch, -0.5, 0.6)
     skel.clavicle_left_yaw    = gui.slider_float("L yaw", skel.clavicle_left_yaw, -0.5, 0.5)
-    skel.clavicle_right_pitch = gui.slider_float("R pitch", skel.clavicle_right_pitch, -0.5, 0.5)
+    skel.clavicle_right_pitch = gui.slider_float("R pitch", skel.clavicle_right_pitch, -0.5, 0.6)
     skel.clavicle_right_yaw   = gui.slider_float("R yaw", skel.clavicle_right_yaw, -0.5, 0.5)
 
 tirender.add_gui_draw(gui_draw)
