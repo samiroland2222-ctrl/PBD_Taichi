@@ -57,8 +57,29 @@ def read_tet_mesh(filepath):
 @ti.data_oriented
 class TetMesh:
 
-  def __init__(self, filepath, rho=1.0, scale=1.0, repose=(0.0, 0.0, 0.0)) -> None:
-    n_v, n_t, n_f, v, t, f = read_tet_mesh(filepath)
+  def __init__(self,
+               filepath: str=None,
+               v: np.ndarray|None=None, t: np.ndarray|None=None, f: np.ndarray|None=None,
+               rho=1.0,
+               scale=1.0,
+               repose=(0.0, 0.0, 0.0)
+  ) -> None:
+    """
+    Load a tet mesh from file and initialize Taichi fields for vertex positions, indices, and mass.
+    :param filepath: Path to the .msh file containing the tet mesh. If provided, v, t, f are ignored.
+    :param v: Vertex positions as a numpy array of shape (n_vert, 3). Ignored if filepath is provided.
+    :param t: Tetrahedron vertex indices as a numpy array of shape (n_tet, 4). Ignored if filepath is provided.
+    :param f: Surface triangle vertex indices as a numpy array of shape (n_face, 3). Ignored if filepath is provided.
+    :param rho: Material density (used to compute mass from volume)
+    """
+    if filepath is not None:
+      n_v, n_t, n_f, v, t, f = read_tet_mesh(filepath)
+      if v is not None and t is not None and f is not None:
+        raise ValueError("Provide either filepath or (v, t, f), not both")
+    elif v is not None and t is not None and f is not None:
+      n_v, n_t, n_f = v.shape[0], t.shape[0] // 4, f.shape[0] // 3
+    else:
+      raise ValueError("Either filepath or (v, t, f) must be provided")
     self.n_vert = n_v
     self.n_face = n_f
     self.n_tet = n_t

@@ -1,10 +1,11 @@
 import taichi as ti
 import numpy as np
 import math
+import random
 
 from cons import framework, deform3d, coopers
 from geom import gtet, obj, anatomy
-from utils import renderer
+from utils import renderer, breast_mesh_generator
 
 ti.init(arch=ti.cpu, cpu_max_num_threads=1)
 
@@ -12,10 +13,52 @@ ti.init(arch=ti.cpu, cpu_max_num_threads=1)
 # Left breast: positive x  (patient's left, +x in world)
 # Right breast: mirrored at negative x — flip x by negating repose and
 #               reflecting the loaded verts through x=0.
-mesh_l = gtet.TetMesh("assets/mesh/breast.msh",
-                       rho=1.0, scale=1.0, repose=( 0.08, 0.0, 0.0))
-mesh_r = gtet.TetMesh("assets/mesh/breast.msh",
-                       rho=1.0, scale=1.0, repose=( 0.08, 0.0, 0.0))
+# Parameters are slightly randomized per side for naturalistic asymmetry.
+
+def _make_breast_mesh(rho=1.0, scale=1.0, repose=(0.08, 0.0, 0.0),
+                      radius=0.07, height=0.06, k=0.7, target_tets=300):
+    """Generate a TetMesh directly from the procedural breast mesh generator."""
+    coords, node_tags, tet_node_tags, _ = breast_mesh_generator.generate_breast_msh(
+        radius=radius, height=height, k=k, target_tets=target_tets)
+
+    # node_tags are 1-indexed; build a mapping to 0-indexed positions
+    tag_to_idx = {tag: i for i, tag in enumerate(node_tags)}
+    v = coords.astype(np.float32)
+
+    # tet_node_tags are 1-indexed node tags → convert to 0-indexed
+    tets = np.array([[tag_to_idx[n] for n in row] for row in tet_node_tags],
+                    dtype=np.int32)
+
+    f = gtet.extract_surface_triangles(v, tets)
+    t_flat = tets.flatten().astype(np.int32)
+    f_flat = f.flatten().astype(np.int32)
+
+    return gtet.TetMesh(v=v, t=t_flat, f=f_flat,
+                        rho=rho, scale=scale, repose=repose)
+
+rng = random.Random(42)
+
+def _rand(center, spread):
+    """Return center ± spread * U(-1, 1)."""
+    return center + spread * (rng.random() * 2 - 1)
+
+# Left breast parameters (slightly randomized)
+mesh_l = _make_breast_mesh(
+    rho=1.0, scale=1.0, repose=(0.08, 0.0, 0.0),
+    radius=_rand(0.070, 0.004),
+    height=_rand(0.060, 0.004),
+    k=_rand(0.70, 0.05),
+    target_tets=300,
+)
+
+# Right breast parameters (independently randomized)
+mesh_r = _make_breast_mesh(
+    rho=1.0, scale=1.0, repose=(0.08, 0.0, 0.0),
+    radius=_rand(0.070, 0.004),
+    height=_rand(0.060, 0.004),
+    k=_rand(0.70, 0.05),
+    target_tets=300,
+)
 
 # Mirror the right breast through x=0: x → -x gives [-0.14, +0.02]
 def _mirror_x(mesh):
