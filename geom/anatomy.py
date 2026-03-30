@@ -5,7 +5,11 @@ Hierarchy:
   chest (root, static)
   └── clavicle_left         – left clavicle, child of chest,
                               can pitch (up/down) and yaw (forward/back)
+      └── upper_arm_left    – upper arm capsule, child of clavicle_left,
+                              ball-and-socket at glenohumeral (GH) joint;
+                              DOF: flexion (rot X) and abduction (rot Z)
   └── clavicle_right        – right clavicle, same DOF
+      └── upper_arm_right   – upper arm capsule, mirror of left
   └── fascia_left           – clavipectoral fascia, deformable quad surface
   └── fascia_right          – clavipectoral fascia, deformable quad surface
 
@@ -37,6 +41,10 @@ def _rot_y(a):
     c, s = np.cos(a), np.sin(a)
     return np.array([[c,0,s],[0,1,0],[-s,0,c]], dtype=np.float32)
 
+def _rot_z(a):
+    c, s = np.cos(a), np.sin(a)
+    return np.array([[c,-s,0],[s,c,0],[0,0,1]], dtype=np.float32)
+
 def _make_ti_mesh(verts_np, faces_np):
     v = ti.Vector.field(3, dtype=ti.f32, shape=len(verts_np))
     f = ti.field(dtype=ti.i32, shape=len(faces_np) * 3)
@@ -49,7 +57,11 @@ def _make_ti_mesh(verts_np, faces_np):
 # Proxy mesh generators
 # ---------------------------------------------------------------------------
 
-def _bone_capsule_verts_local(length=0.136, radius=0.007,
+# Clavicle acromial length – used both in the bone capsule and to compute the
+# glenohumeral joint pivot position.
+_CLAVICLE_LENGTH = 0.136    # metres
+
+def _bone_capsule_verts_local(length=_CLAVICLE_LENGTH, radius=0.007,
                                rings=8, segs=10):
     """
     Capsule with long axis along +x.  Local origin = MEDIAL end (pivot).
@@ -162,6 +174,131 @@ def _bone_capsule_verts_local(length=0.136, radius=0.007,
     return verts, faces, lateral_surf_idx
 
 # ---------------------------------------------------------------------------
+# Upper-arm proxy mesh
+# ---------------------------------------------------------------------------
+#
+# Anthropometric source: ANSUR II (2012), U.S. Army female population.
+# Targeting a slender, athletic build:
+#   Upper-arm length    31.5 cm   – acromion → lateral epicondyle,
+#                                   ≈ 50th-percentile stature-scaled length
+#   Mid-arm circumference  ~25 cm  – radius 4.0 cm,
+#                                   ≈ 10th-percentile circumference (toned build)
+#
+# Glenohumeral (GH) joint offset from the clavicle's LATERAL (acromial) tip,
+# expressed in clavicle-local space (+x along bone, +y superior, +z anterior).
+# The humeral head centre sits ~10 mm lateral and ~12 mm inferior to the
+# acromioclavicular (AC) joint with negligible anterior offset.
+_UPPER_ARM_LENGTH  = 0.315   # metres
+_UPPER_ARM_RADIUS  = 0.040   # metres  (radius, not circumference)
+_GH_LOCAL_OFFSET   = np.array([ 0.010, -0.012,  0.000], dtype=np.float32)
+
+# Pre-computed GH pivot positions in clavicle-local space (before world xform).
+# Left  : lateral tip at (+_CLAVICLE_LENGTH, 0, 0) + offset
+# Right : clavicle x is mirrored, so tip is at (−_CLAVICLE_LENGTH, 0, 0)
+_GH_L_LOCAL = np.array([ _CLAVICLE_LENGTH + _GH_LOCAL_OFFSET[0],
+                          _GH_LOCAL_OFFSET[1], _GH_LOCAL_OFFSET[2]], dtype=np.float32)
+_GH_R_LOCAL = np.array([-(  _CLAVICLE_LENGTH + _GH_LOCAL_OFFSET[0]),
+                          _GH_LOCAL_OFFSET[1], _GH_LOCAL_OFFSET[2]], dtype=np.float32)
+
+
+def _upper_arm_capsule_verts_local(length=_UPPER_ARM_LENGTH, radius=_UPPER_ARM_RADIUS,
+                                    rings=8, segs=12):
+    """
+    Capsule for the upper arm.  Long axis along −y (anatomical hanging position).
+
+    Origin (y = 0) = glenohumeral joint pivot (shoulder, proximal end).
+    y = −length     = elbow (distal end).
+
+    This geometry is shared for both arms; the right side mirrors x before
+    the world-space transform so it is a perfect bilateral reflection.
+
+    Returns verts (N, 3), faces (M, 3).
+    """
+    verts = []
+    faces = []
+
+    # ── cylinder body ─────────────────────────────────────────────────────────
+    for ri in range(rings + 1):
+        t = ri / rings               # 0 = shoulder, 1 = elbow
+        y = -t * length
+        for si in range(segs):
+            angle = 2 * np.pi * si / segs
+            verts.append([radius * np.cos(angle), y, radius * np.sin(angle)])
+
+    for ri in range(rings):
+        for si in range(segs):
+            a = ri * segs + si
+            b = ri * segs + (si + 1) % segs
+            c = (ri + 1) * segs + si
+            d = (ri + 1) * segs + (si + 1) % segs
+            faces += [[a, c, b], [b, c, d]]
+
+    cap_rings = 4
+
+    # ── proximal cap (y = 0, shoulder) — hemisphere extends toward +y ─────────
+    base_prox = len(verts)
+    for ci in range(cap_rings):
+        phi = np.pi / 2 * (ci + 1) / cap_rings
+        y_c  =  radius * np.sin(phi)
+        r2   =  radius * np.cos(phi)
+        for si in range(segs):
+            angle = 2 * np.pi * si / segs
+            verts.append([r2 * np.cos(angle), y_c, r2 * np.sin(angle)])
+    apex_prox = len(verts)
+    verts.append([0.0, radius, 0.0])
+
+    for ci in range(cap_rings):
+        if ci == 0:
+            ring0 = 0        # first cylinder ring
+            for si in range(segs):
+                a = ring0      + si;          b = ring0      + (si + 1) % segs
+                c = base_prox  + si;          d = base_prox  + (si + 1) % segs
+                faces += [[a, b, c], [b, d, c]]
+        else:
+            prev = base_prox + (ci - 1) * segs
+            cur  = base_prox + ci * segs
+            for si in range(segs):
+                a = prev + si;  b = prev + (si + 1) % segs
+                c = cur  + si;  d = cur  + (si + 1) % segs
+                faces += [[a, b, c], [b, d, c]]
+    last_prox = base_prox + (cap_rings - 1) * segs
+    for si in range(segs):
+        faces.append([last_prox + si, last_prox + (si + 1) % segs, apex_prox])
+
+    # ── distal cap (y = −length, elbow) — hemisphere extends toward −y ────────
+    base_dist = len(verts)
+    dist_ring_start = rings * segs        # last cylinder ring
+    for ci in range(cap_rings):
+        phi  = np.pi / 2 * (ci + 1) / cap_rings
+        y_c  = -length - radius * np.sin(phi)
+        r2   =  radius * np.cos(phi)
+        for si in range(segs):
+            angle = 2 * np.pi * si / segs
+            verts.append([r2 * np.cos(angle), y_c, r2 * np.sin(angle)])
+    apex_dist = len(verts)
+    verts.append([0.0, -length - radius, 0.0])
+
+    for ci in range(cap_rings):
+        if ci == 0:
+            for si in range(segs):
+                a = dist_ring_start + si;     b = dist_ring_start + (si + 1) % segs
+                c = base_dist + si;           d = base_dist + (si + 1) % segs
+                faces += [[a, c, b], [b, c, d]]
+        else:
+            prev = base_dist + (ci - 1) * segs
+            cur  = base_dist + ci * segs
+            for si in range(segs):
+                a = prev + si;  b = prev + (si + 1) % segs
+                c = cur  + si;  d = cur  + (si + 1) % segs
+                faces += [[a, c, b], [b, c, d]]
+    last_dist = base_dist + (cap_rings - 1) * segs
+    for si in range(segs):
+        faces.append([last_dist + si, apex_dist, last_dist + (si + 1) % segs])
+
+    return np.array(verts, dtype=np.float32), np.array(faces, dtype=np.int32)
+
+
+# ---------------------------------------------------------------------------
 # Clavipectoral fascia quad surface
 # ---------------------------------------------------------------------------
 
@@ -228,6 +365,11 @@ class Skeleton:
       clavicle_left_pitch  – tilt the bone's lateral end up/down  (rot around Z)
       clavicle_left_yaw    – swing the bone anteriorly/posteriorly (rot around Y)
       (same for right)
+
+    Glenohumeral (shoulder) DOF — expressed in the parent clavicle's local frame:
+      arm_left_flexion     – arm swings anterior (+) / posterior (−)  [rot around +X]
+      arm_left_abduction   – arm swings lateral (+) / adducts  (−)    [rot around +Z]
+      (same for right; positive abduction always moves the arm outward)
 
     chest_pos is the world-space root at the chest wall (z ≈ 0).
     The left breast mesh sits at x ∈ [−0.02, +0.14], y ∈ [−0.08, +0.08],
@@ -307,6 +449,33 @@ class Skeleton:
         self._fascia_l_world = self._fascia_l_v_local + self.chest_pos
         self._fascia_r_world = self._fascia_r_v_local + self.chest_pos
 
+        # ── upper-arm geometry (child of clavicle, pivot = GH joint) ──────────
+        # Both arms share identical capsule geometry; right side mirrors x.
+        # Local frame: y = 0 at shoulder (GH pivot), y = −length at elbow.
+        _ua_v, _ua_f = _upper_arm_capsule_verts_local()
+        self._upper_arm_l_v_local = _ua_v.copy()
+        self._upper_arm_r_v_local = _ua_v.copy()
+        self._upper_arm_r_v_local[:, 0] *= -1   # bilateral mirror around Y-Z plane
+        self._upper_arm_l_f_np = _ua_f
+        self._upper_arm_r_f_np = _ua_f            # same topology; two_sided rendering
+
+        # Glenohumeral DOF angles (in parent clavicle-local frame).
+        # flexion  > 0 → arm swings anterior;  abduction > 0 → arm swings lateral.
+        self.arm_left_flexion    = 0.0
+        self.arm_left_abduction  = 0.0
+        self.arm_right_flexion   = 0.0
+        self.arm_right_abduction = 0.0
+
+        # Taichi render fields for upper arms
+        self.upper_arm_l_v, self.upper_arm_l_f = _make_ti_mesh(
+            self._upper_arm_l_v_local, self._upper_arm_l_f_np)
+        self.upper_arm_r_v, self.upper_arm_r_f = _make_ti_mesh(
+            self._upper_arm_r_v_local, self._upper_arm_r_f_np)
+
+        # World-space caches (populated properly by first update() call below)
+        self._upper_arm_l_world = self._upper_arm_l_v_local.copy()
+        self._upper_arm_r_world = self._upper_arm_r_v_local.copy()
+
         self.update()
 
     # ------------------------------------------------------------------
@@ -320,9 +489,6 @@ class Skeleton:
         # Pitch = tilt lateral end up/down  → rot around Z.
         # Yaw   = swing bone forward/back   → rot around Y.
         # Pivot is at local origin (medial end) — no extra translation needed.
-        def _rot_z(a):
-            c, s = np.cos(a), np.sin(a)
-            return np.array([[c,-s,0],[s,c,0],[0,0,1]], dtype=np.float32)
 
         R_l = _rot_y(self.clavicle_left_yaw) @ _rot_z(self.clavicle_left_pitch)
         R_r = _rot_y(self.clavicle_right_yaw) @ _rot_z(-self.clavicle_right_pitch)
@@ -355,6 +521,34 @@ class Skeleton:
             self._fascia_r_top_idx, self._fascia_r_bot_idx,
             R_r, self._clavicle_r_offset)
         self.fascia_r_v.from_numpy(self._fascia_r_world.astype(np.float32))
+
+        # ── upper arms ────────────────────────────────────────────────────────
+        # GH rotations expressed in clavicle-local frame:
+        #   flexion   → rotation around clavicle-local +X  (arm swings anterior)
+        #   abduction → rotation around clavicle-local +Z  (arm swings lateral)
+        # For the right arm the abduction sign is negated so that positive
+        # arm_right_abduction always moves the arm away from the body.
+        #
+        # Sign note: the arm capsule long-axis is −y; rot_x(+θ) sweeps the elbow
+        # toward −z (posterior), so we negate to obtain the anatomical convention
+        # where +flexion = anterior swing.
+        R_gh_l = _rot_x(-self.arm_left_flexion)  @ _rot_z( self.arm_left_abduction)
+        R_gh_r = _rot_x(-self.arm_right_flexion) @ _rot_z(-self.arm_right_abduction)
+
+        # Combined world-space rotation: clavicle rotation ∘ GH rotation.
+        R_arm_l = R_l @ R_gh_l
+        R_arm_r = R_r @ R_gh_r
+
+        # GH pivot world positions (GH local expressed in the clavicle frame,
+        # then pushed through the same clavicle transform used for the bone mesh).
+        gh_l_world = (_GH_L_LOCAL @ R_l.T) + self.chest_pos + self._clavicle_l_offset
+        gh_r_world = (_GH_R_LOCAL @ R_r.T) + self.chest_pos + self._clavicle_r_offset
+
+        # Transform arm vertices: local → world via (R_arm) then translate to GH pivot.
+        self._upper_arm_l_world = (self._upper_arm_l_v_local @ R_arm_l.T) + gh_l_world
+        self._upper_arm_r_world = (self._upper_arm_r_v_local @ R_arm_r.T) + gh_r_world
+        self.upper_arm_l_v.from_numpy(self._upper_arm_l_world.astype(np.float32))
+        self.upper_arm_r_v.from_numpy(self._upper_arm_r_world.astype(np.float32))
 
     # ------------------------------------------------------------------
     def _update_fascia(self, v_local, top_idx, bot_idx, R, offset):
@@ -413,12 +607,17 @@ class Skeleton:
         self.clavicle_right_pitch = self.clavicle_rest_pitch
         self.clavicle_left_yaw    = self.clavicle_rest_yaw
         self.clavicle_right_yaw   = -self.clavicle_rest_yaw
+        self.arm_left_flexion     = 0.0
+        self.arm_left_abduction   = 0.0
+        self.arm_right_flexion    = 0.0
+        self.arm_right_abduction  = 0.0
         self.update()
 
     # ------------------------------------------------------------------
     def get_render_draws(self, clavicle=(0.60, 0.35, 0.35),
                          ribcage=(0.55, 0.55, 0.65),
-                         fascia=(0.70, 0.80, 0.60)):
+                         fascia=(0.70, 0.80, 0.60),
+                         upper_arm=(0.82, 0.65, 0.55)):
         def draw_clavicle_l(scene):
             scene.mesh(self.clavicle_l_v, self.clavicle_l_f,
                        color=clavicle, two_sided=True)
@@ -431,5 +630,12 @@ class Skeleton:
         def draw_fascia_r(scene):
             scene.mesh(self.fascia_r_v, self.fascia_r_f_ti,
                        color=fascia, two_sided=True)
+        def draw_upper_arm_l(scene):
+            scene.mesh(self.upper_arm_l_v, self.upper_arm_l_f,
+                       color=upper_arm, two_sided=True)
+        def draw_upper_arm_r(scene):
+            scene.mesh(self.upper_arm_r_v, self.upper_arm_r_f,
+                       color=upper_arm, two_sided=True)
         return [draw_clavicle_l, draw_clavicle_r,
-                draw_fascia_l, draw_fascia_r]
+                draw_fascia_l,   draw_fascia_r,
+                draw_upper_arm_l, draw_upper_arm_r]
