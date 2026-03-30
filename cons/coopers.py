@@ -16,6 +16,8 @@ ligaments resist elongation but offer no compression resistance.
 import taichi as ti
 import numpy as np
 
+from PBD_Taichi.cons.breast import Breast
+
 
 @ti.data_oriented
 class CoopersLigaments:
@@ -172,10 +174,7 @@ class CoopersLigaments:
 # ---------------------------------------------------------------------------
 
 def build_coopers(skeleton,
-                  breast_pos_np: np.ndarray,
-                  breast_surface_idx_np: np.ndarray,
-                  breast_pos_field,
-                  breast_invm_field,
+                  breast: Breast,
                   dt: float,
                   alpha: float = 1e-4,
                   pull_only: bool = True,
@@ -183,7 +182,6 @@ def build_coopers(skeleton,
                   n_ligaments: int = 60,
                   outer_z_min: float = 0.03,
                   pretension: float = 1.0,
-                  excluded_vertex_idx: np.ndarray = None,
                   side: str = 'left'):
     """
     Build Cooper's ligaments from the clavipectoral fascia surface to the outer
@@ -202,6 +200,7 @@ def build_coopers(skeleton,
     outer_z_min           : minimum z to be "outer" surface (excludes base)
     excluded_vertex_idx   : vertex indices to never use as targets
     """
+
     # ── fascia anchors for the chosen side ───────────────────────────────
     if side == 'left':
         fascia_anchors = skeleton.get_fascia_left_surface_anchors_np()
@@ -209,13 +208,8 @@ def build_coopers(skeleton,
         fascia_anchors = skeleton.get_fascia_right_surface_anchors_np()
 
     # ── outer breast surface verts only ──────────────────────────────────
-    excluded_set = set(excluded_vertex_idx.tolist()) if excluded_vertex_idx is not None else set()
-    all_surf_verts = breast_pos_np[breast_surface_idx_np]
-    outer_mask = (all_surf_verts[:, 2] > outer_z_min) & \
-                 np.array([i not in excluded_set for i in breast_surface_idx_np])
-    outer_local  = np.where(outer_mask)[0]
-    outer_global = breast_surface_idx_np[outer_local]
-    outer_verts  = breast_pos_np[outer_global]
+    outer_global = breast.top_idx_np
+    outer_verts = breast.verts_np[outer_global]
 
     # ── evenly distribute n_ligaments targets across outer surface ────────
     n_targets = min(n_ligaments, len(outer_global))
@@ -261,14 +255,14 @@ def build_coopers(skeleton,
           f"({n_targets - len(surface_idx_np)} discarded as too far)")
 
     lig = CoopersLigaments(
-        breast_pos     = breast_pos_field,
-        breast_invm    = breast_invm_field,
-        anchor_pos_np  = anchor_pos_np,
-        surface_idx_np = surface_idx_np,
-        dt             = dt,
-        alpha          = alpha,
-        pull_only      = pull_only,
-        pretension     = pretension,
+        breast_pos=(breast.mesh.v_p),
+        breast_invm=(breast.mesh.v_invm),
+        anchor_pos_np=anchor_pos_np,
+        surface_idx_np=surface_idx_np,
+        dt=dt,
+        alpha=alpha,
+        pull_only=pull_only,
+        pretension=pretension,
     )
     lig._anchor_clavicle_idx = chosen_anchor_idx
     return lig, chosen_anchor_idx

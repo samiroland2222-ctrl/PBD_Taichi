@@ -5,58 +5,18 @@ import numpy as np
 import math
 import random
 
-from cons import framework, deform3d, coopers
+from cons import framework, deform3d, coopers, breast
 from geom import gtet, obj, anatomy, gmesh
 from utils import renderer, breast_mesh_generator, parser
+
+from PBD_Taichi.cons.breast import Breast
 
 ti.init(arch=ti.cpu, cpu_max_num_threads=1)
 
 # ── Breast meshes ─────────────────────────────────────────────────────────────
 # Left breast: positive x  (patient's left, +x in world)
-# Right breast: mirrored at negative x — flip x by negating repose and
-#               reflecting the loaded verts through x=0.
+# Right breast: mirrored at negative x — reflecting the loaded verts through x=0.
 # Parameters are slightly randomized per side for naturalistic asymmetry.
-
-def _make_breast_mesh(rho=1.0, scale=1.0, repose=(0.08, 0.0, 0.0), rotate=(0.0, 0.0, 0.0),
-                      radius=0.07, height=0.06, k=0.7, target_tets=300):
-    """Generate a TetMesh directly from the procedural breast mesh generator."""
-    coords, node_tags, tet_node_tags, _ = breast_mesh_generator.generate_breast_msh(
-        radius=radius, height=height, k=k, target_tets=target_tets)
-
-    # node_tags are 1-indexed; build a mapping to 0-indexed positions
-    tag_to_idx = {tag: i for i, tag in enumerate(node_tags)}
-    v = coords.astype(np.float32)
-
-    z_min, z_max = v[:, 2].min(), v[:, 2].max()
-    base_idx = np.where(v[:, 2] <= z_min + (z_max - z_min) * 0.02)[0].astype(np.int32)
-
-    # rotate around x, y, z axes by rotate=(rx, ry, rz) in radians
-    rx, ry, rz = rotate
-    cosx, sinx = math.cos(rx), math.sin(rx)
-    cosy, siny = math.cos(ry), math.sin(ry)
-    cosz, sinz = math.cos(rz), math.sin(rz)
-    rot_x = np.array([[1, 0, 0],
-                      [0, cosx, -sinx],
-                      [0, sinx, cosx]])
-    rot_y = np.array([[cosy, 0, siny],
-                      [0, 1, 0],
-                      [-siny, 0, cosy]])
-    rot_z = np.array([[cosz, -sinz, 0],
-                      [sinz, cosz, 0],
-                      [0, 0, 1]])
-    rot = rot_z @ rot_y @ rot_x
-    v = v @ rot.T
-
-    # tet_node_tags are 1-indexed node tags → convert to 0-indexed
-    tets = np.array([[tag_to_idx[n] for n in row] for row in tet_node_tags],
-                    dtype=np.int32)
-
-    f = gtet.extract_surface_triangles(v, tets)
-    t_flat = tets.flatten().astype(np.int32)
-    f_flat = f.flatten().astype(np.int32)
-
-    return gtet.TetMesh(v=v, t=t_flat, f=f_flat,
-                        rho=rho, scale=scale, repose=repose), base_idx
 
 rng = random.Random(42)
 
@@ -93,44 +53,27 @@ def _load_ribcage_mesh(scale=1.0, repose=(0, 0, 0)):
 
 ribcage = _load_ribcage_mesh(
     scale=1/50,
-    repose=(-0.003, -0.14, -0.08)
+    repose=(-0.003, -0.14, -0.1)
 )
 
-# Left breast parameters (slightly randomized)
-mesh_l, base_idx_l_np = _make_breast_mesh(
-    rho=1.0, scale=1.0, repose=(0.07, 0.0, 0.0), rotate=(-0.2, 0.5, 0.0),
+# Left breast (patient's left, +x in world)
+left = Breast.make(
+    rho=1.0, scale=1.0, spread=0.5,
     radius=_rand(0.070, 0.004),
     height=_rand(0.060, 0.004),
     k=_rand(0.70, 0.05),
     target_tets=300,
 )
 
-# Right breast parameters (independently randomized)
-mesh_r, base_idx_r_np = _make_breast_mesh(
-    rho=1.0, scale=1.0, repose=(0.07, 0.0, 0.0), rotate=(-0.2, 0.5, 0.0),
+# Right breast (mirrored through x=0)
+right = Breast.make(
+    rho=1.0, scale=1.0, spread=-0.5,
     radius=_rand(0.070, 0.004),
     height=_rand(0.060, 0.004),
     k=_rand(0.70, 0.05),
     target_tets=300,
 )
 
-# Mirror the right breast through x=0: x → -x gives [-0.14, +0.02]
-def _mirror_x(mesh):
-    # Flip vertex positions
-    v = mesh.v_p.to_numpy();       v[:, 0]    *= -1; mesh.v_p.from_numpy(v)
-    vref = mesh.v_p_ref.to_numpy(); vref[:, 0] *= -1; mesh.v_p_ref.from_numpy(vref)
-    # Negating x flips handedness → swap two tet vertices to restore positive volume
-    t = mesh.t_i.to_numpy().reshape(-1, 4)
-    t[:, [0, 1]] = t[:, [1, 0]]
-    mesh.t_i.from_numpy(t.flatten().astype(np.int32))
-    # Flip surface triangle winding so normals point outward
-    f = mesh.f_i.to_numpy().reshape(-1, 3)
-    f[:, [0, 1]] = f[:, [1, 0]]
-    mesh.f_i.from_numpy(f.flatten().astype(np.int32))
-    # Recompute mass with corrected geometry
-    mesh.reset_mass(rho=1.0)
-
-_mirror_x(mesh_r)
 
 g          = ti.Vector([0.0, -1.0, 0.0])
 fps        = 60
@@ -139,7 +82,7 @@ solve_step = 2
 dt         = 1.0 / (fps * substep)
 
 # ── Bounding box (covers both breasts) ───────────────────────────────────────
-all_v = np.concatenate([mesh_l.v_p.to_numpy(), mesh_r.v_p.to_numpy()], axis=0)
+all_v = np.concatenate([left.mesh.v_p.to_numpy(), right.mesh.v_p.to_numpy()], axis=0)
 bb_np = np.array([[all_v[:, i].min() - 0.5, all_v[:, i].max() + 0.5]
                   for i in range(3)], dtype=np.float32)
 bb = ti.field(dtype=ti.f32, shape=(3, 2))
@@ -147,60 +90,43 @@ bb.from_numpy(bb_np)
 box3d = obj.BoundBox3D(bound_box=bb, padding=0.01, bound_epsilon=1e-6)
 
 # ── PBD framework + deformation – LEFT ───────────────────────────────────────
-xpbd_l = framework.pbd_framework(g=g, n_vert=mesh_l.n_vert, v_p=mesh_l.v_p,
-                                  dt=dt, damp=0.99, invm=mesh_l.v_invm)
-deform_l = deform3d.Deform3D(n=mesh_l.n_tet, indices=mesh_l.t_i,
-                              invm=mesh_l.v_invm, pos=mesh_l.v_p,
-                              pos_ref=mesh_l.v_p_ref, tet_mass=mesh_l.t_mass,
+xpbd_l = framework.pbd_framework(g=g, n_vert=left.mesh.n_vert, v_p=left.mesh.v_p,
+                                  dt=dt, damp=0.99, invm=left.mesh.v_invm)
+deform_l = deform3d.Deform3D(n=left.mesh.n_tet, indices=left.mesh.t_i,
+                              invm=left.mesh.v_invm, pos=left.mesh.v_p,
+                              pos_ref=left.mesh.v_p_ref, tet_mass=left.mesh.t_mass,
                               dt=dt, hydro_alpha=1e-2, devia_alpha=1e1)
 xpbd_l.add_cons(deform_l)
 xpbd_l.add_collision(box3d.collision)
 xpbd_l.init_rest_status()
 
 # ── PBD framework + deformation – RIGHT ──────────────────────────────────────
-xpbd_r = framework.pbd_framework(g=g, n_vert=mesh_r.n_vert, v_p=mesh_r.v_p,
-                                  dt=dt, damp=0.99, invm=mesh_r.v_invm)
-deform_r = deform3d.Deform3D(n=mesh_r.n_tet, indices=mesh_r.t_i,
-                              invm=mesh_r.v_invm, pos=mesh_r.v_p,
-                              pos_ref=mesh_r.v_p_ref, tet_mass=mesh_r.t_mass,
+xpbd_r = framework.pbd_framework(g=g, n_vert=right.mesh.n_vert, v_p=right.mesh.v_p,
+                                  dt=dt, damp=0.99, invm=right.mesh.v_invm)
+deform_r = deform3d.Deform3D(n=right.mesh.n_tet, indices=right.mesh.t_i,
+                              invm=right.mesh.v_invm, pos=right.mesh.v_p,
+                              pos_ref=right.mesh.v_p_ref, tet_mass=right.mesh.t_mass,
                               dt=dt, hydro_alpha=1e-2, devia_alpha=1e1)
 xpbd_r.add_cons(deform_r)
 xpbd_r.add_collision(box3d.collision)
 xpbd_r.init_rest_status()
 
-# ── Pin base (z ≈ 0) – both breasts ──────────────────────────────────────────
-def _make_base_pin(mesh, idx_np):
-    idx_ti = ti.field(dtype=ti.i32, shape=len(idx_np))
-    idx_ti.from_numpy(idx_np)
-    mesh.set_fixed_point(len(idx_np), idx_ti)
-    return idx_ti
-
-verts_l_np,  verts_r_np  = mesh_l.v_p_ref.to_numpy(), mesh_r.v_p_ref.to_numpy()
-base_idx_l = _make_base_pin(mesh_l, base_idx_l_np)
-base_idx_r = _make_base_pin(mesh_r, base_idx_r_np)
-
 # ── Skeleton ──────────────────────────────────────────────────────────────────
 skel = anatomy.Skeleton()
 
 # ── Cooper's ligaments – LEFT ─────────────────────────────────────────────────
-surf_l = np.unique(mesh_l.f_i.to_numpy().reshape(-1, 3))
 ligaments_l, _ = coopers.build_coopers(
-    skeleton=skel, breast_pos_np=verts_l_np,
-    breast_surface_idx_np=surf_l, breast_pos_field=mesh_l.v_p,
-    breast_invm_field=mesh_l.v_invm, dt=dt, alpha=1e3, pull_only=True,
+    skeleton=skel, breast=left, dt=dt, alpha=1e3, pull_only=True,
     max_attach_dist=0.5, n_ligaments=90, outer_z_min=0.03, pretension=1.0,
-    excluded_vertex_idx=base_idx_l_np, side='left')
+    side='left')
 xpbd_l.add_cons(ligaments_l)
 ligaments_l.init_rest_status()
 
 # ── Cooper's ligaments – RIGHT ────────────────────────────────────────────────
-surf_r = np.unique(mesh_r.f_i.to_numpy().reshape(-1, 3))
 ligaments_r, _ = coopers.build_coopers(
-    skeleton=skel, breast_pos_np=verts_r_np,
-    breast_surface_idx_np=surf_r, breast_pos_field=mesh_r.v_p,
-    breast_invm_field=mesh_r.v_invm, dt=dt, alpha=1e3, pull_only=True,
+    skeleton=skel, breast=right, dt=dt, alpha=1e3, pull_only=True,
     max_attach_dist=0.5, n_ligaments=90, outer_z_min=0.03, pretension=1.0,
-    excluded_vertex_idx=base_idx_r_np, side='right')
+    side='right')
 xpbd_r.add_cons(ligaments_r)
 ligaments_r.init_rest_status()
 
@@ -212,8 +138,8 @@ tirender = renderer.TaichiRenderer3D("Deform 3D – Cooper's Ligaments",
 
 skin = (0.85, 0.65, 0.55)
 tirender.add_scene_render_draw(ribcage.get_render_draw(color=(0.7, 0.7, 0.5), wireframe=False))
-tirender.add_scene_render_draw(mesh_l.get_render_draw(color=skin, wireframe=False))
-tirender.add_scene_render_draw(mesh_r.get_render_draw(color=skin, wireframe=False))
+tirender.add_scene_render_draw(left.mesh.get_render_draw(color=skin, wireframe=True))
+tirender.add_scene_render_draw(right.mesh.get_render_draw(color=skin, wireframe=False))
 for draw in skel.get_render_draws():
     tirender.add_scene_render_draw(draw)
 tirender.add_scene_render_draw(ligaments_l.get_render_draw())
@@ -251,16 +177,12 @@ tirender.add_gui_draw(gui_draw)
 sim = {'paused': False, 'step_once': False, 'sim_rate': 1.0, 'frame': 0}
 
 def sim_reset():
-    for mesh, xpbd, base_idx_np, base_idx_ti, lig, get_anchors in [
-        (mesh_l, xpbd_l, base_idx_l_np, base_idx_l, ligaments_l,
-         skel.get_fascia_left_surface_anchors_np),
-        (mesh_r, xpbd_r, base_idx_r_np, base_idx_r, ligaments_r,
-         skel.get_fascia_right_surface_anchors_np),
+    for breast, xpbd, lig, get_anchors in [
+        (left,  xpbd_l, ligaments_l, skel.get_fascia_left_surface_anchors_np),
+        (right, xpbd_r, ligaments_r, skel.get_fascia_right_surface_anchors_np),
     ]:
-        mesh.v_p.copy_from(mesh.v_p_ref)
+        breast.reset()
         xpbd.v_v.fill(0)
-        mesh.reset_mass(rho=1.0)
-        mesh.set_fixed_point(len(base_idx_np), base_idx_ti)
         lig.update_anchors(get_anchors())
         xpbd.init_rest_status()
         lig.init_rest_status()
@@ -307,13 +229,13 @@ while tirender.window.running:
             should_step = True
 
     if should_step:
-        for xpbd, mesh in [(xpbd_l, mesh_l), (xpbd_r, mesh_r)]:
+        for xpbd, breast in [(xpbd_l, left), (xpbd_r, right)]:
             for _ in range(substep):
-                xpbd.make_prediction_pinned(mesh.v_invm)
+                xpbd.make_prediction_pinned(breast.mesh.v_invm)
                 xpbd.preupdate_cons()
                 for _ in range(solve_step):
                     xpbd.update_cons()
-                xpbd.update_vel_pinned(mesh.v_invm)
+                xpbd.update_vel_pinned(breast.mesh.v_invm)
         sim['frame'] += 1
 
     tirender.render()
