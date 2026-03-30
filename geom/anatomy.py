@@ -238,7 +238,7 @@ class Skeleton:
         self.chest_pos = np.array(chest_pos, dtype=np.float32)
 
         self.clavicle_rest_pitch = np.deg2rad(5.0)
-        self.clavicle_rest_yaw = 0.3
+        self.clavicle_rest_yaw = 0.4
 
         self.clavicle_left_yaw    =  self.clavicle_rest_yaw   # rot around Y: swings bone forward/back
         self.clavicle_right_yaw   = -self.clavicle_rest_yaw

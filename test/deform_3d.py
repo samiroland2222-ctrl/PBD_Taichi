@@ -25,33 +25,28 @@ def _rand(center, spread_pct):
     return center + spread_pct * center * (rng.random() * 2 - 1)
 
 # ribcage
-def _load_ribcage_mesh(scale=1.0, repose=(0, 0, 0)):
-    filepath = os.path.join(os.getcwd(), 'assets', 'mesh', 'ribcage_and_pelvis.obj')
+def _load_mesh(filepath, scale=1.0, repose=(0, 0, 0)):
     verts, faces = parser.obj_parser(filepath)
     verts = verts*scale
     verts -= verts.mean(axis=0)  # center at origin
 
-    # filter to faces that are y>0
-    vert_mask = verts[:, 1] > 0
-    # faces is flat (shape [N*3]), reshape to [N, 3] for masking
-    faces = faces.reshape(-1, 3)
-    face_mask = vert_mask[faces].all(axis=1)
-    faces = faces[face_mask]
-    # flatten
-    faces = faces.flatten().astype(np.int32)
-
     verts += repose
 
-    masked_verts = verts[vert_mask]
+    return gmesh.TrianMesh(verts, faces, dim=3, rho=1.0,
+                           get_edge=False,
+                           get_edgeside=False,
+                           get_edgeNeib=False,
+                           get_faceedge=False
+                           )
 
-    print(f"visible ribcage verts range: "
-          f"x=[{masked_verts[:, 0].min():.3f}, {masked_verts[:, 0].max():.3f}] "
-          f"y=[{masked_verts[:, 1].min():.3f}, {masked_verts[:, 1].max():.3f}] "
-          f"z=[{masked_verts[:, 2].min():.3f}, {masked_verts[:, 2].max():.3f}]")
+skeleton = _load_mesh(
+    filepath=os.path.join(os.getcwd(), 'assets', 'mesh', 'female_skeleton_first_anatomy_study.OBJ'),
+    scale=1/10,
+    repose=(0, -0.255, -0.08)
+)
 
-    return gmesh.TrianMesh(verts, faces, dim=3, rho=1.0)
-
-ribcage = _load_ribcage_mesh(
+ribcage = _load_mesh(
+    filepath=os.path.join(os.getcwd(), 'assets', 'mesh', 'ribcage_and_pelvis.obj'),
     scale=1/50,
     repose=(-0.003, -0.14, -0.1)
 )
@@ -128,6 +123,7 @@ tirender = renderer.TaichiRenderer3D("Deform 3D – Cooper's Ligaments",
                                      cameraLookat=(-0.4, -0.03, -0.17))
 
 skin = (0.85, 0.65, 0.55)
+tirender.add_scene_render_draw(skeleton.get_render_draw(color=(0.7, 0.7, 0.5), wireframe=False))
 tirender.add_scene_render_draw(ribcage.get_render_draw(color=(0.7, 0.7, 0.5), wireframe=False))
 tirender.add_scene_render_draw(left.mesh.get_render_draw(color=skin, wireframe=False))
 tirender.add_scene_render_draw(right.mesh.get_render_draw(color=skin, wireframe=False))

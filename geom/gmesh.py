@@ -19,24 +19,21 @@ class TrianMesh:
       get_edgeNeib=True,  # neighbor face indices of edges
       get_faceedge=True,  # edge infices of faces
       scale=1.0,
-      repose=(0.0, 0.0, 0.0)):
+      repose=(0.0, 0.0, 0.0),
+  ):
     self.dim = dim
 
     n_vert = verts.shape[0]
     n_face = faces.shape[0] // 3
     if dim == 2 and verts.shape[1] == 3:
       verts = mathlib.np_3to2(verts)
-    edge_indices, edge_sides, edge_neib, face_edges = geom2d.edge_extractor(
-        faces)
     assert faces.ndim == 1
-    n_edge = edge_indices.shape[0] // 2
 
     verts = verts * scale
     for i in range(self.dim):
       verts[:, i] += repose[i]
 
     self.n_vert = n_vert
-    self.n_edge = n_edge
     self.n_face = n_face
 
     self.v_p = ti.Vector.field(dim, dtype=ti.f32, shape=n_vert)
@@ -50,18 +47,27 @@ class TrianMesh:
     self.verts_np = verts
     self.faces_np = faces
 
-    if get_edge:
-      self.e_i = ti.field(dtype=ti.i32, shape=n_edge * 2)
-      self.e_i.from_numpy(edge_indices.flatten())
-    if get_edgeside:
-      self.e_sidei = ti.field(dtype=ti.i32, shape=n_edge * 2)
-      self.e_sidei.from_numpy(edge_sides.flatten())
-    if get_edgeNeib:
-      self.e_neibi = ti.field(dtype=ti.i32, shape=n_edge * 2)
-      self.e_neibi.from_numpy(edge_neib.flatten())
-    if get_faceedge:
-      self.f_edgei = ti.field(dtype=ti.i32, shape=n_face * 3)
-      self.f_edgei.from_numpy(face_edges)
+    compute_edges = get_edge or get_edgeNeib or get_edgeside or get_faceedge
+    if not compute_edges:
+      self.n_edge = 0
+    else:
+      edge_indices, edge_sides, edge_neib, face_edges = geom2d.edge_extractor(
+        faces)
+      n_edge = edge_indices.shape[0] // 2
+      self.n_edge = n_edge
+
+      if get_edge:
+        self.e_i = ti.field(dtype=ti.i32, shape=n_edge * 2)
+        self.e_i.from_numpy(edge_indices.flatten())
+      if get_edgeside:
+        self.e_sidei = ti.field(dtype=ti.i32, shape=n_edge * 2)
+        self.e_sidei.from_numpy(edge_sides.flatten())
+      if get_edgeNeib:
+        self.e_neibi = ti.field(dtype=ti.i32, shape=n_edge * 2)
+        self.e_neibi.from_numpy(edge_neib.flatten())
+      if get_faceedge:
+        self.f_edgei = ti.field(dtype=ti.i32, shape=n_face * 3)
+        self.f_edgei.from_numpy(face_edges)
 
     self.compute_mass(rho)
 
@@ -131,3 +137,4 @@ class TrianMesh:
       scene.mesh(self.v_p, self.f_i, color=color, show_wireframe=wireframe)
 
     return render_draw
+
