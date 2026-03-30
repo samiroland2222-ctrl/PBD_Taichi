@@ -20,9 +20,9 @@ ti.init(arch=ti.cpu, cpu_max_num_threads=1)
 
 rng = random.Random(42)
 
-def _rand(center, spread):
+def _rand(center, spread_pct):
     """Return center ± spread * U(-1, 1)."""
-    return center + spread * (rng.random() * 2 - 1)
+    return center + spread_pct * center * (rng.random() * 2 - 1)
 
 # ribcage
 def _load_ribcage_mesh(scale=1.0, repose=(0, 0, 0)):
@@ -56,26 +56,35 @@ ribcage = _load_ribcage_mesh(
     repose=(-0.003, -0.14, -0.1)
 )
 
-# Left breast (patient's left, +x in world)
-left = Breast.make(
-    rho=1.0, scale=1.0, spread=0.5,
-    radius=_rand(0.070, 0.004),
-    height=_rand(0.060, 0.004),
-    k=_rand(0.70, 0.05),
-    target_tets=300,
+def _make_breasts(height=0.1, radius=0.08, k=0.7, spread=0.5, tilt=0.2):
+    # Left breast (patient's left, +x in world)
+    left = Breast.make(
+        rho=1.0, scale=1.0,
+        spread=_rand(spread, 0.1),
+        tilt=_rand(tilt, 0.1),
+        radius=_rand(radius, 0.1),
+        height=_rand(height, 0.1),
+        k=_rand(k, 0.2),
+        target_tets=300,
+    )
+
+    # Right breast (mirrored through x=0)
+    right = Breast.make(
+        rho=1.0, scale=1.0,
+        spread=_rand(-spread, 0.1),
+        tilt=_rand(tilt, 0.1),
+        radius=_rand(radius, 0.1),
+        height=_rand(height, 0.1),
+        k=_rand(k, 0.2),
+        target_tets=300,
+    )
+    return left, right
+
+left, right = _make_breasts(
+    height=0.05, radius=0.08, k=0.7, spread=0.5, tilt=0.2
 )
 
-# Right breast (mirrored through x=0)
-right = Breast.make(
-    rho=1.0, scale=1.0, spread=-0.5,
-    radius=_rand(0.070, 0.004),
-    height=_rand(0.060, 0.004),
-    k=_rand(0.70, 0.05),
-    target_tets=300,
-)
-
-
-g          = ti.Vector([0.0, -1.0, 0.0])
+g          = ti.Vector([0.0, -9.8, 0.0])
 fps        = 60
 substep    = 6
 solve_step = 2
@@ -89,27 +98,9 @@ bb = ti.field(dtype=ti.f32, shape=(3, 2))
 bb.from_numpy(bb_np)
 box3d = obj.BoundBox3D(bound_box=bb, padding=0.01, bound_epsilon=1e-6)
 
-# ── PBD framework + deformation – LEFT ───────────────────────────────────────
-xpbd_l = framework.pbd_framework(g=g, n_vert=left.mesh.n_vert, v_p=left.mesh.v_p,
-                                  dt=dt, damp=0.99, invm=left.mesh.v_invm)
-deform_l = deform3d.Deform3D(n=left.mesh.n_tet, indices=left.mesh.t_i,
-                              invm=left.mesh.v_invm, pos=left.mesh.v_p,
-                              pos_ref=left.mesh.v_p_ref, tet_mass=left.mesh.t_mass,
-                              dt=dt, hydro_alpha=1e-2, devia_alpha=1e1)
-xpbd_l.add_cons(deform_l)
-xpbd_l.add_collision(box3d.collision)
-xpbd_l.init_rest_status()
-
-# ── PBD framework + deformation – RIGHT ──────────────────────────────────────
-xpbd_r = framework.pbd_framework(g=g, n_vert=right.mesh.n_vert, v_p=right.mesh.v_p,
-                                  dt=dt, damp=0.99, invm=right.mesh.v_invm)
-deform_r = deform3d.Deform3D(n=right.mesh.n_tet, indices=right.mesh.t_i,
-                              invm=right.mesh.v_invm, pos=right.mesh.v_p,
-                              pos_ref=right.mesh.v_p_ref, tet_mass=right.mesh.t_mass,
-                              dt=dt, hydro_alpha=1e-2, devia_alpha=1e1)
-xpbd_r.add_cons(deform_r)
-xpbd_r.add_collision(box3d.collision)
-xpbd_r.init_rest_status()
+# ── PBD frameworks ─────────────────────────────────────────────────────────────
+left.build_xpbd_deform(g=g, dt=dt, world_bounds=box3d)
+right.build_xpbd_deform(g=g, dt=dt, world_bounds=box3d)
 
 # ── Skeleton ──────────────────────────────────────────────────────────────────
 skel = anatomy.Skeleton()
@@ -119,7 +110,7 @@ ligaments_l, _ = coopers.build_coopers(
     skeleton=skel, breast=left, dt=dt, alpha=1e3, pull_only=True,
     max_attach_dist=0.5, n_ligaments=90, outer_z_min=0.03, pretension=1.0,
     side='left')
-xpbd_l.add_cons(ligaments_l)
+left.xpbd.add_cons(ligaments_l)
 ligaments_l.init_rest_status()
 
 # ── Cooper's ligaments – RIGHT ────────────────────────────────────────────────
@@ -127,7 +118,7 @@ ligaments_r, _ = coopers.build_coopers(
     skeleton=skel, breast=right, dt=dt, alpha=1e3, pull_only=True,
     max_attach_dist=0.5, n_ligaments=90, outer_z_min=0.03, pretension=1.0,
     side='right')
-xpbd_r.add_cons(ligaments_r)
+right.xpbd.add_cons(ligaments_r)
 ligaments_r.init_rest_status()
 
 # ── Renderer ──────────────────────────────────────────────────────────────────
@@ -138,7 +129,7 @@ tirender = renderer.TaichiRenderer3D("Deform 3D – Cooper's Ligaments",
 
 skin = (0.85, 0.65, 0.55)
 tirender.add_scene_render_draw(ribcage.get_render_draw(color=(0.7, 0.7, 0.5), wireframe=False))
-tirender.add_scene_render_draw(left.mesh.get_render_draw(color=skin, wireframe=True))
+tirender.add_scene_render_draw(left.mesh.get_render_draw(color=skin, wireframe=False))
 tirender.add_scene_render_draw(right.mesh.get_render_draw(color=skin, wireframe=False))
 for draw in skel.get_render_draws():
     tirender.add_scene_render_draw(draw)
@@ -146,18 +137,18 @@ tirender.add_scene_render_draw(ligaments_l.get_render_draw())
 tirender.add_scene_render_draw(ligaments_r.get_render_draw())
 
 # ── GUI ───────────────────────────────────────────────────────────────────────
-log_hydro     = [math.log10(deform_l.hydro_alpha)]
-log_devia     = [math.log10(deform_l.devia_alpha)]
+log_hydro     = [math.log10(left.deform.hydro_alpha)]
+log_devia     = [math.log10(left.deform.devia_alpha)]
 log_lig_alpha = [math.log10(ligaments_l.alpha)]
 
 def gui_draw(gui):
     gui.text("── Tissue stiffness ──")
     log_hydro[0] = gui.slider_float("log10(hydro)", log_hydro[0], -3.0, 3.0)
     log_devia[0] = gui.slider_float("log10(devia)", log_devia[0], -3.0, 3.0)
-    for d in (deform_l, deform_r):
+    for d in (left.deform, right.deform):
         d.hydro_alpha = 10 ** log_hydro[0]
         d.devia_alpha = 10 ** log_devia[0]
-    gui.text(f"  hydro={deform_l.hydro_alpha:.2e}  devia={deform_l.devia_alpha:.2e}")
+    gui.text(f"  hydro={left.deform.hydro_alpha:.2e}  devia={left.deform.devia_alpha:.2e}")
 
     gui.text("── Cooper's ligaments ──")
     log_lig_alpha[0] = gui.slider_float("log10(lig alpha)", log_lig_alpha[0], -1.0, 6.0)
@@ -177,14 +168,12 @@ tirender.add_gui_draw(gui_draw)
 sim = {'paused': False, 'step_once': False, 'sim_rate': 1.0, 'frame': 0}
 
 def sim_reset():
-    for breast, xpbd, lig, get_anchors in [
-        (left,  xpbd_l, ligaments_l, skel.get_fascia_left_surface_anchors_np),
-        (right, xpbd_r, ligaments_r, skel.get_fascia_right_surface_anchors_np),
+    for breast, lig, get_anchors in [
+        (left, ligaments_l, skel.get_fascia_left_surface_anchors_np),
+        (right, ligaments_r, skel.get_fascia_right_surface_anchors_np),
     ]:
         breast.reset()
-        xpbd.v_v.fill(0)
         lig.update_anchors(get_anchors())
-        xpbd.init_rest_status()
         lig.init_rest_status()
     skel.reset_pose()
     sim['frame'] = 0
@@ -229,13 +218,13 @@ while tirender.window.running:
             should_step = True
 
     if should_step:
-        for xpbd, breast in [(xpbd_l, left), (xpbd_r, right)]:
+        for breast in [left, right]:
             for _ in range(substep):
-                xpbd.make_prediction_pinned(breast.mesh.v_invm)
-                xpbd.preupdate_cons()
+                breast.xpbd.make_prediction_pinned(breast.mesh.v_invm)
+                breast.xpbd.preupdate_cons()
                 for _ in range(solve_step):
-                    xpbd.update_cons()
-                xpbd.update_vel_pinned(breast.mesh.v_invm)
+                    breast.xpbd.update_cons()
+                breast.xpbd.update_vel_pinned(breast.mesh.v_invm)
         sim['frame'] += 1
 
     tirender.render()

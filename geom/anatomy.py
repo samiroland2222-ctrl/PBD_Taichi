@@ -169,7 +169,8 @@ def _fascia_verts_local(rows=6, cols=6,
                          top_x0=0.02, top_x1=0.16,
                          top_y=0.0,   top_z=0.02,
                          bot_x0=0.01, bot_x1=0.14,
-                         bot_y=-0.08, bot_z=0.0):
+                         bot_y=-0.08,
+                         bot_z0=0.0, bot_z1=0.02):
     """
     Generate a (rows × cols) quad grid representing the clavipectoral fascia
     for the LEFT side (positive x).
@@ -193,6 +194,7 @@ def _fascia_verts_local(rows=6, cols=6,
             top_x = top_x0 + s * (top_x1 - top_x0)
             top_pt = np.array([top_x, top_y, top_z], dtype=np.float32)
             bot_x  = bot_x0 + s * (bot_x1 - bot_x0)
+            bot_z  = bot_z0 + s * (bot_z1 - bot_z0)
             bot_pt = np.array([bot_x, bot_y, bot_z], dtype=np.float32)
             p = (1.0 - t) * top_pt + t * bot_pt
             verts.append(p)
@@ -232,11 +234,14 @@ class Skeleton:
     z ∈ [0, 0.1].
     """
 
-    def __init__(self, chest_pos=(0.0, 0.08, 0.0)):
+    def __init__(self, chest_pos=(0.0, 0.12, -0.05)):
         self.chest_pos = np.array(chest_pos, dtype=np.float32)
 
-        self.clavicle_left_yaw    = 0.0   # rot around Y: swings bone forward/back
-        self.clavicle_right_yaw   = 0.0
+        self.clavicle_rest_pitch = np.deg2rad(5.0)
+        self.clavicle_rest_yaw = 0.3
+
+        self.clavicle_left_yaw    =  self.clavicle_rest_yaw   # rot around Y: swings bone forward/back
+        self.clavicle_right_yaw   = -self.clavicle_rest_yaw
         # pitch set to anatomical default after geometry is built (below)
 
         # ── local geometray ────────────────────────────────────────────────
@@ -253,8 +258,9 @@ class Skeleton:
              rows=_FASCIA_ROWS, cols=_FASCIA_COLS,
              top_x0=0.0,   top_x1=0.136,   # along clavicle local-x (medial→lateral)
              top_y=0.0,    top_z=0.0,       # top edge at clavicle pivot origin
-             bot_x0=0.01,  bot_x1=0.14,    # chest-local bottom edge
-             bot_y=-0.08,  bot_z=0.0)
+             bot_x0=0.01,  bot_x1=0.1,    # chest-local bottom edge
+             bot_y=-0.11,
+             bot_z0=0.04, bot_z1=-0.0)
 
         # Right fascia: mirror x — top runs from 0 toward -0.136
         (self._fascia_r_v_local, self._fascia_r_f_np,
@@ -262,8 +268,9 @@ class Skeleton:
              rows=_FASCIA_ROWS, cols=_FASCIA_COLS,
              top_x0=0.0,    top_x1=-0.136,
              top_y=0.0,     top_z=0.0,
-             bot_x0=-0.01,  bot_x1=-0.14,
-             bot_y=-0.08,   bot_z=0.0)
+             bot_x0=-0.01,  bot_x1=-0.1,
+             bot_y=-0.11,
+             bot_z0=0.04, bot_z1=-0.0)
 
         # ── joint offsets from chest_pos ──────────────────────────────────
         # Sternoclavicular joint sits at the manubrium, level with R1.
@@ -274,8 +281,8 @@ class Skeleton:
         self._clavicle_r_offset = np.array([-0.010,  0.035, 0.0], dtype=np.float32)
 
         # Natural resting pitch: clavicle rises ~5° superiorly from medial to lateral
-        self.clavicle_left_pitch  =  np.deg2rad(5.0)
-        self.clavicle_right_pitch =  np.deg2rad(5.0)
+        self.clavicle_left_pitch  = self.clavicle_rest_pitch
+        self.clavicle_right_pitch = self.clavicle_rest_pitch
 
         # ── Taichi fields ─────────────────────────────────────────────────
         self.clavicle_l_v,  self.clavicle_l_f  = _make_ti_mesh(
@@ -402,10 +409,10 @@ class Skeleton:
     # ------------------------------------------------------------------
     def reset_pose(self):
         """Restore all joint angles to anatomical neutral and recompute world positions."""
-        self.clavicle_left_pitch  = np.deg2rad(5.0)   # natural superior bow
-        self.clavicle_right_pitch = np.deg2rad(5.0)
-        self.clavicle_left_yaw    = 0.0
-        self.clavicle_right_yaw   = 0.0
+        self.clavicle_left_pitch  = self.clavicle_rest_pitch   # natural superior bow
+        self.clavicle_right_pitch = self.clavicle_rest_pitch
+        self.clavicle_left_yaw    = self.clavicle_rest_yaw
+        self.clavicle_right_yaw   = -self.clavicle_rest_yaw
         self.update()
 
     # ------------------------------------------------------------------
