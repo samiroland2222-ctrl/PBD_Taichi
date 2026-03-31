@@ -6,151 +6,115 @@ import math
 import random
 
 from cons import framework, deform3d, coopers, breast
+from cons.torso import UnifiedTorso
 from geom import gtet, obj, anatomy, gmesh
 from utils import renderer, breast_mesh_generator, parser
 
-from PBD_Taichi.cons.breast import Breast
-
 ti.init(arch=ti.cpu, cpu_max_num_threads=1)
 
-# ── Breast meshes ─────────────────────────────────────────────────────────────
-# Left breast: positive x  (patient's left, +x in world)
-# Right breast: mirrored at negative x — reflecting the loaded verts through x=0.
-# Parameters are slightly randomized per side for naturalistic asymmetry.
+# ── Ribcage mesh (static visual + optional skin anchor source) ────────────────
 
-rng = random.Random(42)
-
-def _rand(center, spread_pct):
-    """Return center ± spread * U(-1, 1)."""
-    return center + spread_pct * center * (rng.random() * 2 - 1)
-
-# ribcage
 def _load_mesh(filepath, scale=1.0, repose=(0, 0, 0)):
     verts, faces = parser.obj_parser(filepath)
-    verts = verts*scale
-    verts -= verts.mean(axis=0)  # center at origin
-
+    verts = verts * scale
+    verts -= verts.mean(axis=0)
     verts += repose
-
     return gmesh.TrianMesh(verts, faces, dim=3, rho=1.0,
-                           get_edge=False,
-                           get_edgeside=False,
-                           get_edgeNeib=False,
-                           get_faceedge=False
-                           )
+                           get_edge=False, get_edgeside=False,
+                           get_edgeNeib=False, get_faceedge=False)
 
-skeleton = _load_mesh(
+skeleton_mesh = _load_mesh(
     filepath=os.path.join(os.getcwd(), 'assets', 'mesh', 'female_skeleton_first_anatomy_study.OBJ'),
     scale=1/10,
     repose=(0, -0.255, -0.08)
 )
 
-ribcage = _load_mesh(
+ribcage_mesh = _load_mesh(
     filepath=os.path.join(os.getcwd(), 'assets', 'mesh', 'ribcage_and_pelvis.obj'),
     scale=1/50,
     repose=(-0.003, -0.14, -0.1)
 )
 
-def _make_breasts(height=0.1, radius=0.08, k=0.7, spread=0.5, tilt=0.2):
-    # Left breast (patient's left, +x in world)
-    left = Breast.make(
-        rho=1.0, scale=1.0,
-        spread=_rand(spread, 0.1),
-        tilt=_rand(tilt, 0.1),
-        radius=_rand(radius, 0.1),
-        height=_rand(height, 0.1),
-        k=_rand(k, 0.2),
-        target_tets=300,
-    )
+# ── Skeleton (clavicles + upper arms) ─────────────────────────────────────────
+skel = anatomy.Skeleton()
 
-    # Right breast (mirrored through x=0)
-    right = Breast.make(
-        rho=1.0, scale=1.0,
-        spread=_rand(-spread, 0.1),
-        tilt=_rand(tilt, 0.1),
-        radius=_rand(radius, 0.1),
-        height=_rand(height, 0.1),
-        k=_rand(k, 0.2),
-        target_tets=300,
-    )
-    return left, right
-
-left, right = _make_breasts(
-    height=0.05, radius=0.08, k=0.7, spread=0.5, tilt=0.2
-)
-
-g          = ti.Vector([0.0, -9.8, 0.0])
+# ── Simulation parameters ─────────────────────────────────────────────────────
+g          = (0.0, -9.8, 0.0)
 fps        = 60
 substep    = 6
 solve_step = 2
 dt         = 1.0 / (fps * substep)
 
-# ── Bounding box (covers both breasts) ───────────────────────────────────────
-all_v = np.concatenate([left.mesh.v_p.to_numpy(), right.mesh.v_p.to_numpy()], axis=0)
+# ── UnifiedTorso: merged breasts + skin shell ─────────────────────────────────
+ribcage_verts = ribcage_mesh.v_p.to_numpy()
+torso = UnifiedTorso(
+    skel,
+    breast_height=0.05,
+    breast_radius=0.08,
+    breast_k=0.7,
+    breast_spread=0.5,
+    breast_tilt=0.2,
+    breast_target_tets=300,
+    ribcage_verts_np=ribcage_verts,
+    skin_n_u=20,
+    skin_n_v=30,
+    skin_thickness=0.005,
+    g=g,
+    dt=dt,
+    fps=fps,
+    substep=substep,
+)
+
+# ── Bounding box ──────────────────────────────────────────────────────────────
+all_v = torso.mesh.v_p.to_numpy()
 bb_np = np.array([[all_v[:, i].min() - 0.5, all_v[:, i].max() + 0.5]
                   for i in range(3)], dtype=np.float32)
 bb = ti.field(dtype=ti.f32, shape=(3, 2))
 bb.from_numpy(bb_np)
 box3d = obj.BoundBox3D(bound_box=bb, padding=0.01, bound_epsilon=1e-6)
-
-# ── PBD frameworks ─────────────────────────────────────────────────────────────
-left.build_xpbd_deform(g=g, dt=dt, world_bounds=box3d)
-right.build_xpbd_deform(g=g, dt=dt, world_bounds=box3d)
-
-# ── Skeleton ──────────────────────────────────────────────────────────────────
-skel = anatomy.Skeleton()
-
-# ── Cooper's ligaments – LEFT ─────────────────────────────────────────────────
-ligaments_l, _ = coopers.build_coopers(
-    skeleton=skel, breast=left, dt=dt, alpha=1e3, pull_only=True,
-    max_attach_dist=0.5, n_ligaments=90, outer_z_min=0.03, pretension=1.0,
-    side='left')
-left.xpbd.add_cons(ligaments_l)
-ligaments_l.init_rest_status()
-
-# ── Cooper's ligaments – RIGHT ────────────────────────────────────────────────
-ligaments_r, _ = coopers.build_coopers(
-    skeleton=skel, breast=right, dt=dt, alpha=1e3, pull_only=True,
-    max_attach_dist=0.5, n_ligaments=90, outer_z_min=0.03, pretension=1.0,
-    side='right')
-right.xpbd.add_cons(ligaments_r)
-ligaments_r.init_rest_status()
+torso.xpbd.add_collision(box3d.collision)
 
 # ── Renderer ──────────────────────────────────────────────────────────────────
-tirender = renderer.TaichiRenderer3D("Deform 3D – Cooper's Ligaments",
+tirender = renderer.TaichiRenderer3D("Deform 3D – Unified Torso",
                                      res=(900, 900), fps=fps,
                                      cameraPos=(0.5, 0.15, 0.2),
                                      cameraLookat=(-0.4, -0.03, -0.17))
 
-skin = (0.85, 0.65, 0.55)
-tirender.add_scene_render_draw(skeleton.get_render_draw(color=(0.7, 0.7, 0.5), wireframe=False))
-tirender.add_scene_render_draw(ribcage.get_render_draw(color=(0.7, 0.7, 0.5), wireframe=False))
-tirender.add_scene_render_draw(left.mesh.get_render_draw(color=skin, wireframe=False))
-tirender.add_scene_render_draw(right.mesh.get_render_draw(color=skin, wireframe=False))
+skin_color = (0.85, 0.65, 0.55)
+tirender.add_scene_render_draw(skeleton_mesh.get_render_draw(color=(0.7, 0.7, 0.5), wireframe=False))
+tirender.add_scene_render_draw(ribcage_mesh.get_render_draw(color=(0.7, 0.7, 0.5), wireframe=False))
+for draw in torso.get_render_draws():
+    tirender.add_scene_render_draw(draw)
 for draw in skel.get_render_draws():
     tirender.add_scene_render_draw(draw)
-tirender.add_scene_render_draw(ligaments_l.get_render_draw())
-tirender.add_scene_render_draw(ligaments_r.get_render_draw())
+for draw in torso.get_ligament_draws():
+    tirender.add_scene_render_draw(draw)
 
 # ── GUI ───────────────────────────────────────────────────────────────────────
-log_hydro     = [math.log10(left.deform.hydro_alpha)]
-log_devia     = [math.log10(left.deform.devia_alpha)]
-log_lig_alpha = [math.log10(ligaments_l.alpha)]
+log_hydro     = [math.log10(torso.deform.hydro_alpha)]
+log_devia     = [math.log10(torso.deform.devia_alpha)]
+log_lig_alpha = [math.log10(torso.ligaments_l.alpha)]
+log_skin_alpha = [math.log10(torso.skin_anchors.alpha)] if torso.skin_anchors.n > 0 else [0.0]
 
 def gui_draw(gui):
     gui.text("── Tissue stiffness ──")
     log_hydro[0] = gui.slider_float("log10(hydro)", log_hydro[0], -3.0, 3.0)
     log_devia[0] = gui.slider_float("log10(devia)", log_devia[0], -3.0, 3.0)
-    for d in (left.deform, right.deform):
-        d.hydro_alpha = 10 ** log_hydro[0]
-        d.devia_alpha = 10 ** log_devia[0]
-    gui.text(f"  hydro={left.deform.hydro_alpha:.2e}  devia={left.deform.devia_alpha:.2e}")
+    torso.deform.hydro_alpha = 10 ** log_hydro[0]
+    torso.deform.devia_alpha = 10 ** log_devia[0]
+    gui.text(f"  hydro={torso.deform.hydro_alpha:.2e}  devia={torso.deform.devia_alpha:.2e}")
 
     gui.text("── Cooper's ligaments ──")
-    log_lig_alpha[0] = gui.slider_float("log10(lig alpha)", log_lig_alpha[0], -1.0, 6.0)
-    for lig in (ligaments_l, ligaments_r):
-        lig.alpha = 10 ** log_lig_alpha[0]
-    gui.text(f"  alpha={ligaments_l.alpha:.2e}  n_l={ligaments_l.n}  n_r={ligaments_r.n}")
+    log_lig_alpha[0] = gui.slider_float("log10(lig)", log_lig_alpha[0], -1.0, 6.0)
+    torso.ligaments_l.alpha = 10 ** log_lig_alpha[0]
+    torso.ligaments_r.alpha = 10 ** log_lig_alpha[0]
+    gui.text(f"  alpha={torso.ligaments_l.alpha:.2e}")
+
+    if torso.skin_anchors.n > 0:
+        gui.text("── Skin anchors ──")
+        log_skin_alpha[0] = gui.slider_float("log10(skin)", log_skin_alpha[0], -4.0, 3.0)
+        torso.skin_anchors.alpha = 10 ** log_skin_alpha[0]
+        gui.text(f"  alpha={torso.skin_anchors.alpha:.2e}  n={torso.skin_anchors.n}")
 
     gui.text("── Clavicle joints ──")
     skel.clavicle_left_pitch  = gui.slider_float("L pitch", skel.clavicle_left_pitch, -0.5, 0.6)
@@ -158,19 +122,19 @@ def gui_draw(gui):
     skel.clavicle_right_pitch = gui.slider_float("R pitch", skel.clavicle_right_pitch, -0.5, 0.6)
     skel.clavicle_right_yaw   = gui.slider_float("R yaw", skel.clavicle_right_yaw, -0.5, 0.5)
 
+    gui.text("── Arm joints ──")
+    skel.arm_left_flexion    = gui.slider_float("L flex", skel.arm_left_flexion, -1.0, 2.5)
+    skel.arm_left_abduction  = gui.slider_float("L abd", skel.arm_left_abduction, -0.3, 2.5)
+    skel.arm_right_flexion   = gui.slider_float("R flex", skel.arm_right_flexion, -1.0, 2.5)
+    skel.arm_right_abduction = gui.slider_float("R abd", skel.arm_right_abduction, -0.3, 2.5)
+
 tirender.add_gui_draw(gui_draw)
 
 # ── Simulation control ────────────────────────────────────────────────────────
 sim = {'paused': False, 'step_once': False, 'sim_rate': 1.0, 'frame': 0}
 
 def sim_reset():
-    for breast, lig, get_anchors in [
-        (left, ligaments_l, skel.get_fascia_left_surface_anchors_np),
-        (right, ligaments_r, skel.get_fascia_right_surface_anchors_np),
-    ]:
-        breast.reset()
-        lig.update_anchors(get_anchors())
-        lig.init_rest_status()
+    torso.reset()
     skel.reset_pose()
     sim['frame'] = 0
 
@@ -196,9 +160,11 @@ _wall_prev = _time.time()
 while tirender.window.running:
     tirender.handle_input()
 
+    # Update skeleton and kinematic skin anchors once per frame
     skel.update()
-    ligaments_l.update_anchors(skel.get_fascia_left_surface_anchors_np())
-    ligaments_r.update_anchors(skel.get_fascia_right_surface_anchors_np())
+    torso.update_kinematic_skin()
+    torso.ligaments_l.update_anchors(skel.get_fascia_left_surface_anchors_np())
+    torso.ligaments_r.update_anchors(skel.get_fascia_right_surface_anchors_np())
 
     wall_now   = _time.time()
     wall_delta = wall_now - _wall_prev
@@ -214,14 +180,12 @@ while tirender.window.running:
             should_step = True
 
     if should_step:
-        for breast in [left, right]:
-            for _ in range(substep):
-                breast.xpbd.make_prediction_pinned(breast.mesh.v_invm)
-                breast.xpbd.preupdate_cons()
-                for _ in range(solve_step):
-                    breast.xpbd.update_cons()
-                breast.xpbd.update_vel_pinned(breast.mesh.v_invm)
+        for _ in range(substep):
+            torso.xpbd.make_prediction_pinned(torso.mesh.v_invm)
+            torso.xpbd.preupdate_cons()
+            for _ in range(solve_step):
+                torso.xpbd.update_cons()
+            torso.xpbd.update_vel_pinned(torso.mesh.v_invm)
         sim['frame'] += 1
 
     tirender.render()
-

@@ -499,11 +499,11 @@ class Skeleton:
         # Right bone: flip x so it extends toward -x (right shoulder)
         clavicle_r_local_mirrored = self._clavicle_r_v_local.copy()
         clavicle_r_local_mirrored[:, 0] *= -1
-        clavicle_r_world = self._transform_verts(
+        self._clavicle_r_world = self._transform_verts(
             clavicle_r_local_mirrored, R_r, self._clavicle_r_offset)
 
         self.clavicle_l_v.from_numpy(self._clavicle_l_world)
-        self.clavicle_r_v.from_numpy(clavicle_r_world)
+        self.clavicle_r_v.from_numpy(self._clavicle_r_world)
 
         # ── update fascia ─────────────────────────────────────────────────
         # Top edge of fascia tracks the clavicle local frame (same R + offset).
@@ -599,6 +599,22 @@ class Skeleton:
     def get_fascia_right_surface_anchors_np(self):
         """World-space positions of ALL right fascia vertices (used as ligament anchors)."""
         return self._fascia_r_world.copy()   # (n_fascia, 3)
+
+    def get_clavicle_left_world_np(self):
+        """World-space positions of ALL left clavicle vertices."""
+        return self._clavicle_l_world.copy()
+
+    def get_clavicle_right_world_np(self):
+        """World-space positions of ALL right clavicle vertices."""
+        return self._clavicle_r_world.copy()
+
+    def get_upper_arm_left_surface_np(self):
+        """World-space positions of ALL left upper-arm vertices."""
+        return self._upper_arm_l_world.copy()
+
+    def get_upper_arm_right_surface_np(self):
+        """World-space positions of ALL right upper-arm vertices."""
+        return self._upper_arm_r_world.copy()
 
     # ------------------------------------------------------------------
     def reset_pose(self):

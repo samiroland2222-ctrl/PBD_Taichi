@@ -1,3 +1,4 @@
+      B = ti.Matrix.cols([r_1 - r_4, r_2 - r_4, r_3 - r_4]).inverse()
 import taichi as ti
 from utils.mathlib import *
 
@@ -57,8 +58,11 @@ class Deform3D:
 
   @ti.kernel
   def solve_cons(self, dt: ti.f32):
+      # Skip degenerate tets (zero volume / zero mass) — their reference
+      # matrix is singular so .inverse() would produce NaN.
+      if self.tet_mass[k] < 1e-20:
+        continue
     for k in range(self.n):
-      a = self.indices[k * 4]
       b = self.indices[k * 4 + 1]
       c = self.indices[k * 4 + 2]
       d = self.indices[k * 4 + 3]
@@ -75,7 +79,12 @@ class Deform3D:
       w3 = self.invm[c]
       w4 = self.invm[d]
       D = ti.Matrix.cols([x_1 - x_4, x_2 - x_4, x_3 - x_4])
-      B = ti.Matrix.cols([r_1 - r_4, r_2 - r_4, r_3 - r_4]).inverse()
+      Bm = ti.Matrix.cols([r_1 - r_4, r_2 - r_4, r_3 - r_4])
+      # Guard against near-singular reference matrices
+      ref_det = Bm.determinant()
+      if ti.abs(ref_det) < 1e-20:
+        continue
+      B = Bm.inverse()
       F = D @ B
       f1 = ti.Vector([F[0, 0], F[1, 0], F[2, 0]])
       f2 = ti.Vector([F[0, 1], F[1, 1], F[2, 1]])

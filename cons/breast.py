@@ -48,6 +48,42 @@ class Breast:
         return self.mesh.v_p_ref.to_numpy()
 
     @classmethod
+    def make_numpy(cls, rho=1.0, scale=1.0, spread=0.0, back_distance=0.125, tilt=0.2,
+                   radius=0.07, height=0.06, k=0.7, target_tets=300):
+        """Generate breast mesh data as numpy arrays, without creating Taichi fields.
+
+        Returns (v, t_flat, f_flat, base_idx, top_idx).
+        Vertices are already scaled by *scale*.
+        """
+        coords, node_tags, tet_node_tags, _ = breast_mesh_generator.generate_breast_msh(
+            radius=radius, height=height, k=k, target_tets=target_tets)
+
+        tag_to_idx = {tag: i for i, tag in enumerate(node_tags)}
+        v = coords.astype(np.float64)
+
+        z_min, z_max = v[:, 2].min(), v[:, 2].max()
+        base_idx = np.where(v[:, 2] <= z_min + (z_max - z_min) * 0.02)[0].astype(np.int32)
+        all_idx = np.arange(len(node_tags))
+        top_idx = np.setdiff1d(all_idx, base_idx)
+
+        pivot = np.array([0.0, -0.02, -back_distance], dtype=np.float64)
+        cosx, sinx = math.cos(-tilt), math.sin(-tilt)
+        cosy, siny = math.cos(spread), math.sin(spread)
+        rot = np.array([[cosy, sinx * siny, cosx * siny],
+                        [0, cosx, -sinx],
+                        [-siny, sinx * cosy, cosx * cosy]], dtype=np.float64)
+        v = (v - pivot) @ rot.T + pivot
+
+        v = (v * scale).astype(np.float32)
+
+        tets = np.array([[tag_to_idx[n] for n in row] for row in tet_node_tags],
+                        dtype=np.int32)
+        f = gtet.extract_surface_triangles(v, tets)
+        t_flat = tets.flatten().astype(np.int32)
+        f_flat = f.flatten().astype(np.int32)
+        return v, t_flat, f_flat, base_idx, top_idx
+
+    @classmethod
     def make(cls, rho=1.0, scale=1.0, spread=0.0, back_distance=0.125, tilt=0.2,
                       radius=0.07, height=0.06, k=0.7, target_tets=300) -> 'Breast':
         """Generate a TetMesh directly from the procedural breast mesh generator.
@@ -57,40 +93,13 @@ class Breast:
           2. Rotate *spread* radians about the Y-axis pivoting at (0, 0, -back_distance)
              (left/right spread away from the midline).
         """
-        coords, node_tags, tet_node_tags, _ = breast_mesh_generator.generate_breast_msh(
-            radius=radius, height=height, k=k, target_tets=target_tets)
+        v, t_flat, f_flat, base_idx, top_idx = cls.make_numpy(
+            rho=rho, scale=scale, spread=spread, back_distance=back_distance,
+            tilt=tilt, radius=radius, height=height, k=k, target_tets=target_tets)
 
-        # node_tags are 1-indexed; build a mapping to 0-indexed positions
-        tag_to_idx = {tag: i for i, tag in enumerate(node_tags)}
-        v = coords.astype(np.float64)
-
-        z_min, z_max = v[:, 2].min(), v[:, 2].max()
-        base_idx = np.where(v[:, 2] <= z_min + (z_max - z_min) * 0.02)[0].astype(np.int32)
-        # top_idx = indexes that are not base_idx
-        all_idx = np.arange(len(node_tags))
-        top_idx = np.setdiff1d(all_idx, base_idx)
-
-        pivot = np.array([0.0, -0.02, -back_distance], dtype=np.float64)
-        cosx, sinx = math.cos(-tilt), math.sin(-tilt)
-        cosy, siny = math.cos(spread), math.sin(spread)
-        # Combined rotation: rot_spread @ rot_tilt (Y applied after X, same pivot)
-        rot = np.array([[cosy, sinx * siny, cosx * siny],
-                        [0, cosx, -sinx],
-                        [-siny, sinx * cosy, cosx * cosy]], dtype=np.float64)
-        v = (v - pivot) @ rot.T + pivot
-
-        v = v.astype(np.float32)
-
-        # tet_node_tags are 1-indexed node tags → convert to 0-indexed
-        tets = np.array([[tag_to_idx[n] for n in row] for row in tet_node_tags],
-                        dtype=np.int32)
-
-        f = gtet.extract_surface_triangles(v, tets)
-        t_flat = tets.flatten().astype(np.int32)
-        f_flat = f.flatten().astype(np.int32)
-
+        # TetMesh applies scale internally, but we already scaled in make_numpy
         mesh = gtet.TetMesh(v=v, t=t_flat, f=f_flat,
-                            rho=rho, scale=scale)
+                            rho=rho, scale=1.0)
         return cls(mesh, base_idx, top_idx)
 
     def reset(self):

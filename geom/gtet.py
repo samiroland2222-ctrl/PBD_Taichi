@@ -54,6 +54,26 @@ def read_tet_mesh(filepath):
   return n_v, n_t, n_f, v, t.flatten(), f.flatten()
 
 
+def merge_numpy(*parts):
+  """Merge multiple (verts, tets_flat, faces_flat) tuples into one.
+
+  Each *part* is ``(v, t_flat, f_flat)`` where indices in *t_flat* and
+  *f_flat* are 0-based within that part.  Returns the concatenated arrays
+  with the second/third/… parts' indices offset by the accumulated vertex
+  count.
+  """
+  all_v, all_t, all_f = [], [], []
+  offset = 0
+  for v, t, f in parts:
+    all_v.append(v)
+    all_t.append(t + offset)
+    all_f.append(f + offset)
+    offset += len(v)
+  return (np.concatenate(all_v, axis=0).astype(np.float32),
+          np.concatenate(all_t, axis=0).astype(np.int32),
+          np.concatenate(all_f, axis=0).astype(np.int32))
+
+
 @ti.data_oriented
 class TetMesh:
 
@@ -128,7 +148,10 @@ class TetMesh:
       self.v_invm[p3] += self.t_mass[k] / 4.0
       self.v_invm[p4] += self.t_mass[k] / 4.0
     for k in range(self.n_vert):
-      self.v_invm[k] = 1.0 / self.v_invm[k]
+      if self.v_invm[k] > 0.0:
+        self.v_invm[k] = 1.0 / self.v_invm[k]
+      else:
+        self.v_invm[k] = 0.0  # orphan vertex — treat as immovable
 
   @ti.kernel
   def set_fixed_point(self, n: ti.i32, index: ti.template()):
