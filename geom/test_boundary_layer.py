@@ -16,7 +16,7 @@ Tests verify:
 
 import numpy as np
 import pytest
-from PBD_Taichi.geom.distance_field import BasicTriMesh, build_boundary_layer
+from PBD_Taichi.geom.distance_field import Mesh, build_boundary_layer
 
 
 # ─────────────────────────────────────────────────────────────
@@ -28,7 +28,7 @@ def make_star_prism(
     outer_r: float = 1.0,
     inner_r: float = 0.4,
     height: float = 0.5,
-) -> BasicTriMesh:
+) -> Mesh:
     """Return a closed triangulated star-prism surface.
 
     The star cross-section has `n_points` outer tips (at `outer_r`) and
@@ -65,7 +65,7 @@ def make_star_prism(
         faces.append([i,    j,    n+j ])
         faces.append([i,    n+j,  n+i ])
 
-    return BasicTriMesh(
+    return Mesh(
         verts=np.asarray(verts, dtype=np.float64),
         faces=np.asarray(faces,  dtype=np.int32),
     )
@@ -106,23 +106,23 @@ class TestStarPrismBoundaryLayer:
         self.thickness = 0.05
 
     def test_output_shapes(self):
-        result = build_boundary_layer(self.mesh, self.thickness, debug_save_path="/tmp/star_output_shapes.msh")
+        result = build_boundary_layer(self.mesh, self.thickness)
         assert result.verts.shape[1] == 3
         assert result.tets.shape[1] == 4
         print(f"\n[star5] verts={result.verts.shape[0]}  tets={result.tets.shape[0]}")
 
     def test_index_validity(self):
-        result = build_boundary_layer(self.mesh, self.thickness, debug_save_path="/tmp/star_index_validity.msh")
+        result = build_boundary_layer(self.mesh, self.thickness)
         assert result.tets.min() >= 0
         assert result.tets.max() < len(result.verts)
 
     def test_no_degenerate_tets(self):
-        result = build_boundary_layer(self.mesh, self.thickness, debug_save_path="/tmp/star_no_degenerate_tets.msh")
+        result = build_boundary_layer(self.mesh, self.thickness)
         degen = np.array([len(set(row)) < 4 for row in result.tets])
         assert not degen.any(), f"{degen.sum()} degenerate tets found"
 
     def test_layer_is_non_trivial(self):
-        result = build_boundary_layer(self.mesh, self.thickness, debug_save_path="/tmp/star_layer_is_non_trivial.msh")
+        result = build_boundary_layer(self.mesh, self.thickness)
         _check_tet_mesh(result, self.thickness)
 
 
@@ -140,18 +140,18 @@ class TestDeepConcavityBoundaryLayer:
         self.thickness = 0.02
 
     def test_output_shapes(self):
-        result = build_boundary_layer(self.mesh, self.thickness, debug_save_path="/tmp/dc_output_shapes.msh")
+        result = build_boundary_layer(self.mesh, self.thickness)
         assert result.verts.shape[1] == 3
         assert result.tets.shape[1] == 4
         print(f"\n[sharp5] verts={result.verts.shape[0]}  tets={result.tets.shape[0]}")
 
     def test_index_validity(self):
-        result = build_boundary_layer(self.mesh, self.thickness, debug_save_path="/tmp/dc_index_validity.msh")
+        result = build_boundary_layer(self.mesh, self.thickness)
         assert result.tets.min() >= 0
         assert result.tets.max() < len(result.verts)
 
     def test_no_degenerate_tets(self):
-        result = build_boundary_layer(self.mesh, self.thickness, debug_save_path="/tmp/dc_no_degenerate_tets.msh")
+        result = build_boundary_layer(self.mesh, self.thickness)
         degen = np.array([len(set(row)) < 4 for row in result.tets])
         assert not degen.any(), f"{degen.sum()} degenerate tets found"
 
@@ -164,18 +164,18 @@ class TestManyPointsStarBoundaryLayer:
         self.thickness = 0.04
 
     def test_output_shapes(self):
-        result = build_boundary_layer(self.mesh, self.thickness, debug_save_path='/tmp/mps_output_shapes.msh')
+        result = build_boundary_layer(self.mesh, self.thickness)
         assert result.verts.shape[1] == 3
         assert result.tets.shape[1] == 4
         print(f"\n[star6] verts={result.verts.shape[0]}  tets={result.tets.shape[0]}")
 
     def test_index_validity(self):
-        result = build_boundary_layer(self.mesh, self.thickness, debug_save_path='/tmp/mps_index_validity.msh')
+        result = build_boundary_layer(self.mesh, self.thickness)
         assert result.tets.min() >= 0
         assert result.tets.max() < len(result.verts)
 
     def test_no_degenerate_tets(self):
-        result = build_boundary_layer(self.mesh, self.thickness, debug_save_path='/tmp/mps_no_degenerate_tets.msh')
+        result = build_boundary_layer(self.mesh, self.thickness)
         degen = np.array([len(set(row)) < 4 for row in result.tets])
         assert not degen.any(), f"{degen.sum()} degenerate tets found"
 

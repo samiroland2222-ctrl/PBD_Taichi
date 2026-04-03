@@ -2,45 +2,10 @@ import numpy as np
 import taichi as ti
 import meshio
 
-
-def extract_surface_triangles(verts, tets):
-  """Extract surface triangles with consistent outward winding.
-  Surface faces are those belonging to only one tetrahedron."""
-  # Map sorted face tuple -> (tet index, local face indices in tet)
-  face_map = {}
-  # Local face definitions: each row is 3 vertex indices of a face,
-  # and the 4th vertex is the one opposite (used to determine outward dir)
-  tet_face_defs = [
-      ([0, 1, 2], 3),
-      ([0, 1, 3], 2),
-      ([0, 2, 3], 1),
-      ([1, 2, 3], 0),
-  ]
-  for ti_idx, tet in enumerate(tets):
-    for face_verts, opposite in tet_face_defs:
-      key = tuple(sorted([tet[i] for i in face_verts]))
-      if key in face_map:
-        face_map[key] = None  # shared by two tets -> interior
-      else:
-        face_map[key] = (tet[face_verts[0]], tet[face_verts[1]],
-                         tet[face_verts[2]], tet[opposite])
-
-  surface = []
-  for key, val in face_map.items():
-    if val is None:
-      continue
-    a_i, b_i, c_i, opp_i = val
-    a, b, c = verts[a_i], verts[b_i], verts[c_i]
-    opp = verts[opp_i]
-    n = np.cross(b - a, c - a)
-    # Outward normal should point away from the opposite vertex
-    if np.dot(n, a - opp) < 0:
-      # Flip winding
-      surface.append([a_i, c_i, b_i])
-    else:
-      surface.append([a_i, b_i, c_i])
-
-  return np.array(surface, dtype=np.int32)
+try:
+    from PBD_Taichi.geom.distance_field import extract_surface_triangles
+except ImportError:
+    from geom.distance_field import extract_surface_triangles  # noqa: F401 (re-export)
 
 
 def read_tet_mesh(filepath):

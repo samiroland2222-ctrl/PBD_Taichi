@@ -6,34 +6,19 @@ import numpy as np
 import taichi as ti
 
 from PBD_Taichi.geom.distance_field import BasicTetMesh
+import random as _random
 
-try:
-    from PBD_Taichi.cons import framework, deform3d, coopers, skin_anchor
-    from PBD_Taichi.cons.breast import Breast
-    from PBD_Taichi.cons.skin_anchor import BaryBreastSkinConstraint, KinematicSkinSpringConstraint
-    from PBD_Taichi.geom import gtet, skin as skin_mod
-    from PBD_Taichi.geom.skin import AnchorType, BarycentricBindingDefinition
-except ImportError:
-    from cons import framework, deform3d, coopers, skin_anchor
-    from cons.breast import Breast
-    from cons.skin_anchor import BaryBreastSkinConstraint, KinematicSkinSpringConstraint
-    from geom import gtet, skin as skin_mod
-    from geom.skin import AnchorType
+rng = _random.Random(42)
 
-# ---------------------------------------------------------------------------
-# Lightweight adapter so build_coopers can work on a region of the unified mesh
-# ---------------------------------------------------------------------------
-class BreastRegion:
-    """Provides the Breast-like interface that build_coopers expects."""
-    def __init__(self, mesh: gtet.TetMesh,
-                 base_idx_np: np.ndarray,
-                 top_idx_np: np.ndarray):
-        self.mesh = mesh
-        self.base_idx_np = base_idx_np
-        self.top_idx_np  = top_idx_np
-    @property
-    def verts_np(self):
-        return self.mesh.v_p_ref.to_numpy()
+def _rand(center, spread_pct):
+    return center + spread_pct * center * (rng.random() * 2 - 1)
+
+
+from PBD_Taichi.cons import framework, deform3d, coopers
+from PBD_Taichi.cons.breast import Breast, BreastRegion
+from PBD_Taichi.cons.skin_anchor import BaryBreastSkinConstraint, KinematicSkinSpringConstraint
+from PBD_Taichi.geom import gtet, skin as skin_mod
+from PBD_Taichi.geom.skin import AnchorType, BarycentricBindingDefinition
 
 # ---------------------------------------------------------------------------
 # UnifiedTorso
@@ -76,10 +61,6 @@ class UnifiedTorso:
         fps=60,
         substep=6,
     ):
-        import random as _random
-        rng = rng or _random.Random(42)
-        def _rand(center, spread_pct):
-            return center + spread_pct * center * (rng.random() * 2 - 1)
 
         self.skeleton = skeleton
         if dt is None:
@@ -144,14 +125,17 @@ class UnifiedTorso:
                                  rho=1.0, scale=1.0)
 
         # ── 3b. skin trimesh – Taichi fields for rendering only ───────────
-        n_sv = len(shell.verts)
+        skin_surf_f = self.skin_shell.surface_faces()          # (F, 3) int32
+        skin_surf_v = self.skin_shell.verts.astype(np.float32) # (N, 3) float32
+        n_sv = len(skin_surf_v)
+        n_sf = skin_surf_f.size                                # flat element count
         self.skin_v = ti.Vector.field(3, dtype=ti.f32, shape=max(1, n_sv))
-        if n_sv > 0:
-            self.skin_v.from_numpy(shell.verts.astype(np.float32))
-        n_sf = len(shell.faces_flat)
         self.skin_f = ti.field(dtype=ti.i32, shape=max(1, n_sf))
+        if n_sv > 0:
+            self.skin_v.from_numpy(skin_surf_v)
         if n_sf > 0:
-            self.skin_f.from_numpy(shell.faces_flat.astype(np.int32))
+            self.skin_f.from_numpy(skin_surf_f.flatten())
+
 
         # ── index offsets ─────────────────────────────────────────────────
         self.left_offset  = 0
@@ -244,7 +228,7 @@ class UnifiedTorso:
         """Render the raycast skin surface (visual only)."""
         sv, sf = self.skin_v, self.skin_f
         def draw_skin(scene):
-            scene.mesh(sv, sf, color=color, two_sided=True)
+            scene.mesh(sv, sf, color=color, two_sided=True, show_wireframe=True)
         return [draw_skin]
 
     def get_ligament_draws(self):

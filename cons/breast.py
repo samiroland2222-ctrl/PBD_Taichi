@@ -110,3 +110,15 @@ class Breast:
             self.xpbd.v_v.fill(0)
             self.xpbd.init_rest_status()
 
+
+class BreastRegion:
+    """Provides the Breast-like interface that build_coopers expects."""
+    def __init__(self, mesh: gtet.TetMesh,
+                 base_idx_np: np.ndarray,
+                 top_idx_np: np.ndarray):
+        self.mesh = mesh
+        self.base_idx_np = base_idx_np
+        self.top_idx_np  = top_idx_np
+    @property
+    def verts_np(self):
+        return self.mesh.v_p_ref.to_numpy()

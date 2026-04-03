@@ -30,10 +30,13 @@ from enum import IntEnum
 
 import numpy as np
 
-from PBD_Taichi.geom.distance_field import BasicTetMesh
+from PBD_Taichi.geom.gtet import TetMesh
 from PBD_Taichi.geom.obj import BoundBox3D
-from PBD_Taichi.geom import distance_field as df
-from PBD_Taichi.geom import gtet, anatomy
+
+try:
+    from PBD_Taichi.geom import gtet, anatomy
+except ImportError:
+    from geom import gtet
 
 
 # ---------------------------------------------------------------------------
@@ -100,7 +103,9 @@ def generate_skin_shell(
     ribcage_faces: np.ndarray | None = None,
     target_n_tets: int = 600,
     thickness: float = 0.005,
-) -> tuple[BasicTetMesh, list[BarycentricBindingDefinition]]:
+) -> tuple[TetMesh, list[BarycentricBindingDefinition]]:
+
+    from PBD_Taichi.geom import distance_field as df
 
     _empty_f = np.zeros((0, 3), dtype=np.int32)
     _empty_v = np.zeros((0, 3), dtype=np.float64)
@@ -123,7 +128,7 @@ def generate_skin_shell(
     rc_f = np.asarray(ribcage_faces,  dtype=np.int32).reshape(-1, 3) if ribcage_faces is not None else _empty_f
 
     # ── 1. Boolean merge all anatomy meshes → merged_surface ──────────────
-    merge_inputs: list[df.BasicTriMesh] = []
+    merge_inputs: list[df.Mesh] = []
     for v, f in [
         (clav_l_v, clav_l_f), (clav_r_v, clav_r_f),
         (arm_l_v,  arm_l_f),  (arm_r_v,  arm_r_f),
@@ -134,10 +139,10 @@ def generate_skin_shell(
             merge_inputs.append(df.BasicTriMesh(verts=v, faces=f))
 
     if not merge_inputs:
-        raise ValueError("No input meshes found.")
+        return []
 
-    print(f"[generate_skin_shell] Boolean-merging {len(merge_inputs)} anatomy meshes…")
-    merged_surface = df.boolean_merge_meshes(merge_inputs)
+    print(f"[generate_skin_shell] Boolean-merging {len(merge_inputs)} anatomy meshes...")
+    merged_surface = df.boolean_merge_meshes(merge_inputs, debug_save_path="generate_skin_shell.msh")
     print(f"[generate_skin_shell] Merged surface: {len(merged_surface.verts)} verts, "
           f"{len(merged_surface.faces)} faces")
 
@@ -175,7 +180,7 @@ def generate_skin_shell(
 
     if len(soup_tris) == 0:
         print("[generate_skin_shell] Warning: empty tagged soup – no bindings produced.")
-        return bindings
+        return shell, bindings
 
     best_tri_arr, best_uvw_arr, best_dist_arr = _batch_closest_triangles(
         inner_verts.astype(np.float64), soup_tris,

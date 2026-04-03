@@ -4,14 +4,101 @@ import numpy as np
 
 class BasicTriMesh:
     def __init__(self, verts: np.ndarray, faces: np.ndarray):
-        self.verts = verts
-        self.faces = faces
+        self.verts = verts # [N_v, 3]
+        self.faces = faces # [N_f, 3]
+
+    def deduplicated(self, tol: float = 1e-8) -> 'BasicTriMesh':
+        """Return a new BasicTriMesh with duplicate vertices removed and faces remapped.
+        Vertices within `tol` are considered identical.
+        """
+        # Round vertices to avoid floating-point noise
+        verts_rounded = np.round(self.verts / tol) * tol
+        # Find unique vertices and mapping from old to new
+        verts_unique, inverse = np.unique(verts_rounded, axis=0, return_inverse=True)
+        # Remap faces
+        faces_dedup = inverse[self.faces]
+        return BasicTriMesh(verts_unique, faces_dedup)
+
+    def mirrored_x(self) -> 'BasicTriMesh':
+        mirrored_verts = self.verts.copy()
+        mirrored_faces = self.faces.copy()
+        # bilateral mirror around Y-Z plane
+        mirrored_verts[:, 0] *= -1
+        # swap face winding to maintain outward normals after mirroring
+        mirrored_faces[:, 0] = self.faces[:, 1]
+        mirrored_faces[:, 1] = self.faces[:, 0]
+        return BasicTriMesh(mirrored_verts, mirrored_faces)
+
+
+
+def extract_surface_triangles(verts: np.ndarray, tets: np.ndarray) -> np.ndarray:
+    """Extract the boundary (surface) triangles of a tetrahedral mesh.
+
+    Surface faces are those belonging to exactly one tetrahedron.  Winding
+    is corrected so each triangle's outward normal points away from the
+    opposite interior vertex of its owning tet.
+
+    Parameters
+    ----------
+    verts : (N, 3) float array
+    tets  : (M, 4) int array, 0-indexed
+
+    Returns
+    -------
+    faces : (F, 3) int32 – surface triangles with consistent outward winding.
+    """
+    # Each tet contributes 4 faces; (face_verts, opposite_vertex_local_idx)
+    tet_face_defs = [
+        ([0, 1, 2], 3),
+        ([0, 1, 3], 2),
+        ([0, 2, 3], 1),
+        ([1, 2, 3], 0),
+    ]
+
+    # Map sorted-vertex-key → (a, b, c, opposite) or None (shared → interior)
+    face_map: dict = {}
+    for tet in tets:
+        for face_verts, opp_local in tet_face_defs:
+            key = tuple(sorted(tet[i] for i in face_verts))
+            if key in face_map:
+                face_map[key] = None          # shared by two tets → interior
+            else:
+                face_map[key] = (int(tet[face_verts[0]]),
+                                 int(tet[face_verts[1]]),
+                                 int(tet[face_verts[2]]),
+                                 int(tet[opp_local]))
+
+    surface = []
+    for val in face_map.values():
+        if val is None:
+            continue
+        a_i, b_i, c_i, opp_i = val
+        a, b, c, opp = verts[a_i], verts[b_i], verts[c_i], verts[opp_i]
+        # Flip winding if normal points toward the opposite (interior) vertex
+        if np.dot(np.cross(b - a, c - a), a - opp) < 0:
+            surface.append([a_i, c_i, b_i])
+        else:
+            surface.append([a_i, b_i, c_i])
+
+    return np.array(surface, dtype=np.int32) if surface else np.zeros((0, 3), dtype=np.int32)
 
 
 class BasicTetMesh:
     def __init__(self, verts: np.ndarray, tets: np.ndarray):
         self.verts = verts  # (N, 3) float64
         self.tets = tets    # (M, 4) int32, 0-indexed
+
+    def surface_faces(self) -> np.ndarray:
+        """Return the surface (boundary) triangles of this tet mesh.
+
+        Surface triangles are those belonging to exactly one tetrahedron.
+        Winding is corrected to be consistently outward-facing.
+
+        Returns
+        -------
+        faces : (F, 3) int32 – vertex-index triples of each surface triangle.
+        """
+        return extract_surface_triangles(self.verts, self.tets)
 
 
 # ── private helpers ────────────────────────────────────────────────────────────
@@ -147,16 +234,18 @@ def _extrude_to_tets(mesh: BasicTriMesh, heights: list[float], debug_save_path: 
 
 # ── public API ─────────────────────────────────────────────────────────────────
 
-def boolean_merge_meshes(meshes: list[BasicTriMesh]) -> BasicTriMesh:
+def boolean_merge_meshes(meshes: list[BasicTriMesh], debug_save_path=None) -> BasicTriMesh:
 
     gmsh.initialize()
     gmsh.model.add("boolean_merge")
 
     surf_tags = []
     for i, mesh in enumerate(meshes):
+        # deduplicate verts
+        mesh = mesh.deduplicated()
         # Add points
         point_tags = []
-        for v in mesh.verts:
+        for vert_i, v in enumerate(mesh.verts):
             tag = gmsh.model.occ.addPoint(float(v[0]), float(v[1]), float(v[2]))
             point_tags.append(tag)
         # Add triangles as surfaces
@@ -189,6 +278,10 @@ def boolean_merge_meshes(meshes: list[BasicTriMesh]) -> BasicTriMesh:
     verts = np.array(node_coords, dtype=np.float64).reshape(-1, 3)
     elem_types, elem_tags, elem_node_tags = gmsh.model.mesh.getElements(dim=2)
     faces = np.array(elem_node_tags[0], dtype=np.int32).reshape(-1, 3) - 1  # gmsh is 1-based
+
+    if debug_save_path:
+        # save .msh
+        gmsh.write(debug_save_path)
 
     gmsh.finalize()
 
@@ -330,4 +423,3 @@ def build_boundary_layer(
 
     gmsh.finalize()
     return BasicTetMesh(verts=verts_out, tets=tets_out)
-

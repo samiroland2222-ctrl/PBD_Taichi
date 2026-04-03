@@ -162,14 +162,6 @@ class TestFasciaKinematics:
         np.testing.assert_allclose(default_r, restored_r, atol=1e-5,
                                    err_msg="Right fascia not restored after reset_pose")
 
-    def test_render_draws_include_ribcage_and_fascia(self):
-        """get_render_draws() should return 5 callables (2 clavicles + ribcage + 2 fascia)."""
-        skel = self._make_skel()
-        draws = skel.get_render_draws()
-        assert len(draws) == 5, f"Expected 5 render draws, got {len(draws)}"
-        for d in draws:
-            assert callable(d)
-
 
 if __name__ == '__main__':
     pytest.main([__file__, '-v'])

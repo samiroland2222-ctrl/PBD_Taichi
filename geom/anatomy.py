@@ -28,6 +28,8 @@ outer surface of the breasts.
 import numpy as np
 import taichi as ti
 
+from PBD_Taichi.geom.distance_field import BasicTriMesh
+
 
 # ---------------------------------------------------------------------------
 # helpers
@@ -61,8 +63,7 @@ def _make_ti_mesh(verts_np, faces_np):
 # glenohumeral joint pivot position.
 _CLAVICLE_LENGTH = 0.136    # metres
 
-def _bone_capsule_verts_local(length=_CLAVICLE_LENGTH, radius=0.007,
-                               rings=8, segs=10):
+def _clavicle_capsule_verts_local():
     """
     Capsule with long axis along +x.  Local origin = MEDIAL end (pivot).
     x runs from 0 (medial/sternum end, pivot) to +length (lateral/shoulder).
@@ -70,108 +71,8 @@ def _bone_capsule_verts_local(length=_CLAVICLE_LENGTH, radius=0.007,
     Returns verts (N,3), faces (M,3), lateral_surf_idx (indices of cylinder
     surface verts on the lateral half, used as Cooper's ligament anchors).
     """
-    verts = []
-    faces = []
-
-    # ── cylinder body ────────────────────────────────────────────────────
-    # x runs 0..length (medial to lateral); origin at medial end
-    for ri in range(rings + 1):
-        t  = ri / rings          # 0..1  (medial..lateral)
-        x  = t * length
-        for si in range(segs):
-            angle = 2 * np.pi * si / segs
-            y = radius * np.cos(angle)
-            z = radius * np.sin(angle)
-            verts.append([x, y, z])
-
-    for ri in range(rings):
-        for si in range(segs):
-            a  = ri * segs + si
-            b  = ri * segs + (si + 1) % segs
-            c  = (ri + 1) * segs + si
-            d  = (ri + 1) * segs + (si + 1) % segs
-            faces += [[a, c, b], [b, c, d]]
-
-    cap_rings = 4
-
-    # ── lateral cap (+x, shoulder end) ───────────────────────────────────
-    base_lat = len(verts)
-    lat_ring_start = rings * segs
-    for ci in range(cap_rings):
-        phi = np.pi / 2 * (ci + 1) / cap_rings
-        x   = length + radius * np.sin(phi)
-        r2  = radius * np.cos(phi)
-        for si in range(segs):
-            angle = 2 * np.pi * si / segs
-            verts.append([x, r2 * np.cos(angle), r2 * np.sin(angle)])
-    apex_lat = len(verts)
-    verts.append([length + radius, 0.0, 0.0])
-
-    for ci in range(cap_rings):
-        if ci == 0:
-            for si in range(segs):
-                a = lat_ring_start + si
-                b = lat_ring_start + (si + 1) % segs
-                c = base_lat + si
-                d = base_lat + (si + 1) % segs
-                faces += [[a, c, b], [b, c, d]]
-        else:
-            prev = base_lat + (ci - 1) * segs
-            cur  = base_lat + ci * segs
-            for si in range(segs):
-                a = prev + si
-                b = prev + (si + 1) % segs
-                c = cur  + si
-                d = cur  + (si + 1) % segs
-                faces += [[a, c, b], [b, c, d]]
-    last_lat = base_lat + (cap_rings - 1) * segs
-    for si in range(segs):
-        faces.append([last_lat + si, apex_lat, last_lat + (si + 1) % segs])
-
-    # ── medial cap (x=0, sternum/pivot end) ──────────────────────────────
-    base_med = len(verts)
-    med_ring_start = 0
-    for ci in range(cap_rings):
-        phi = np.pi / 2 * (ci + 1) / cap_rings
-        x   = -radius * np.sin(phi)
-        r2  = radius * np.cos(phi)
-        for si in range(segs):
-            angle = 2 * np.pi * si / segs
-            verts.append([x, r2 * np.cos(angle), r2 * np.sin(angle)])
-    apex_med = len(verts)
-    verts.append([-radius, 0.0, 0.0])
-
-    for ci in range(cap_rings):
-        if ci == 0:
-            for si in range(segs):
-                a = med_ring_start + si
-                b = med_ring_start + (si + 1) % segs
-                c = base_med + si
-                d = base_med + (si + 1) % segs
-                faces += [[a, b, c], [b, d, c]]
-        else:
-            prev = base_med + (ci - 1) * segs
-            cur  = base_med + ci * segs
-            for si in range(segs):
-                a = prev + si
-                b = prev + (si + 1) % segs
-                c = cur  + si
-                d = cur  + (si + 1) % segs
-                faces += [[a, b, c], [b, d, c]]
-    last_med = base_med + (cap_rings - 1) * segs
-    for si in range(segs):
-        faces.append([last_med + si, last_med + (si + 1) % segs, apex_med])
-
-    verts = np.array(verts, dtype=np.float32)
-    faces = np.array(faces, dtype=np.int32)
-
-    # Lateral half of cylinder surface verts (x > length/2) → ligament anchors
-    cyl_count = (rings + 1) * segs
-    cyl_verts = verts[:cyl_count]
-    lateral_mask = cyl_verts[:, 0] > length * 0.1
-    lateral_surf_idx = np.where(lateral_mask)[0].astype(np.int32)
-
-    return verts, faces, lateral_surf_idx
+    clavicle_mesh = _make_capsule(length=_CLAVICLE_LENGTH, radius=0.007, rings=8, segs=10)
+    return clavicle_mesh
 
 # ---------------------------------------------------------------------------
 # Upper-arm proxy mesh
@@ -201,8 +102,8 @@ _GH_R_LOCAL = np.array([-(  _CLAVICLE_LENGTH + _GH_LOCAL_OFFSET[0]),
                           _GH_LOCAL_OFFSET[1], _GH_LOCAL_OFFSET[2]], dtype=np.float32)
 
 
-def _upper_arm_capsule_verts_local(length=_UPPER_ARM_LENGTH, radius=_UPPER_ARM_RADIUS,
-                                    rings=8, segs=12):
+def _make_upper_arm_capsule(length=_UPPER_ARM_LENGTH, radius=_UPPER_ARM_RADIUS,
+                            rings=8, segs=12) -> BasicTriMesh:
     """
     Capsule for the upper arm.  Long axis along −y (anatomical hanging position).
 
@@ -211,91 +112,36 @@ def _upper_arm_capsule_verts_local(length=_UPPER_ARM_LENGTH, radius=_UPPER_ARM_R
 
     This geometry is shared for both arms; the right side mirrors x before
     the world-space transform so it is a perfect bilateral reflection.
-
-    Returns verts (N, 3), faces (M, 3).
     """
-    verts = []
-    faces = []
+    return _make_capsule(length=length, radius=radius, rings=rings, segs=segs)
 
-    # ── cylinder body ─────────────────────────────────────────────────────────
-    for ri in range(rings + 1):
-        t = ri / rings               # 0 = shoulder, 1 = elbow
-        y = -t * length
-        for si in range(segs):
-            angle = 2 * np.pi * si / segs
-            verts.append([radius * np.cos(angle), y, radius * np.sin(angle)])
 
-    for ri in range(rings):
-        for si in range(segs):
-            a = ri * segs + si
-            b = ri * segs + (si + 1) % segs
-            c = (ri + 1) * segs + si
-            d = (ri + 1) * segs + (si + 1) % segs
-            faces += [[a, c, b], [b, c, d]]
+def _make_capsule(length, radius, rings=8, segs=12) -> BasicTriMesh:
+    """
+    Capsule with long axis along −y (anatomical hanging position).
+    """
 
-    cap_rings = 4
-
-    # ── proximal cap (y = 0, shoulder) — hemisphere extends toward +y ─────────
-    base_prox = len(verts)
-    for ci in range(cap_rings):
-        phi = np.pi / 2 * (ci + 1) / cap_rings
-        y_c  =  radius * np.sin(phi)
-        r2   =  radius * np.cos(phi)
-        for si in range(segs):
-            angle = 2 * np.pi * si / segs
-            verts.append([r2 * np.cos(angle), y_c, r2 * np.sin(angle)])
-    apex_prox = len(verts)
-    verts.append([0.0, radius, 0.0])
-
-    for ci in range(cap_rings):
-        if ci == 0:
-            ring0 = 0        # first cylinder ring
-            for si in range(segs):
-                a = ring0      + si;          b = ring0      + (si + 1) % segs
-                c = base_prox  + si;          d = base_prox  + (si + 1) % segs
-                faces += [[a, b, c], [b, d, c]]
-        else:
-            prev = base_prox + (ci - 1) * segs
-            cur  = base_prox + ci * segs
-            for si in range(segs):
-                a = prev + si;  b = prev + (si + 1) % segs
-                c = cur  + si;  d = cur  + (si + 1) % segs
-                faces += [[a, b, c], [b, d, c]]
-    last_prox = base_prox + (cap_rings - 1) * segs
-    for si in range(segs):
-        faces.append([last_prox + si, last_prox + (si + 1) % segs, apex_prox])
-
-    # ── distal cap (y = −length, elbow) — hemisphere extends toward −y ────────
-    base_dist = len(verts)
-    dist_ring_start = rings * segs        # last cylinder ring
-    for ci in range(cap_rings):
-        phi  = np.pi / 2 * (ci + 1) / cap_rings
-        y_c  = -length - radius * np.sin(phi)
-        r2   =  radius * np.cos(phi)
-        for si in range(segs):
-            angle = 2 * np.pi * si / segs
-            verts.append([r2 * np.cos(angle), y_c, r2 * np.sin(angle)])
-    apex_dist = len(verts)
-    verts.append([0.0, -length - radius, 0.0])
-
-    for ci in range(cap_rings):
-        if ci == 0:
-            for si in range(segs):
-                a = dist_ring_start + si;     b = dist_ring_start + (si + 1) % segs
-                c = base_dist + si;           d = base_dist + (si + 1) % segs
-                faces += [[a, c, b], [b, c, d]]
-        else:
-            prev = base_dist + (ci - 1) * segs
-            cur  = base_dist + ci * segs
-            for si in range(segs):
-                a = prev + si;  b = prev + (si + 1) % segs
-                c = cur  + si;  d = cur  + (si + 1) % segs
-                faces += [[a, c, b], [b, c, d]]
-    last_dist = base_dist + (cap_rings - 1) * segs
-    for si in range(segs):
-        faces.append([last_dist + si, apex_dist, last_dist + (si + 1) % segs])
-
-    return np.array(verts, dtype=np.float32), np.array(faces, dtype=np.int32)
+    import gmsh
+    import numpy as np
+    gmsh.initialize()
+    gmsh.model.add("upper_arm_capsule")
+    # Cylinder axis: from (0, 0, 0) to (0, -length, 0)
+    cyl = gmsh.model.occ.addCylinder(0, 0, 0, 0, -length, 0, radius)
+    # Proximal hemisphere (shoulder)
+    sph_prox = gmsh.model.occ.addSphere(0, 0, 0, radius)
+    # Distal hemisphere (elbow)
+    sph_dist = gmsh.model.occ.addSphere(0, -length, 0, radius)
+    # Fragment to get a capsule
+    gmsh.model.occ.fragment([(3, cyl)], [(3, sph_prox), (3, sph_dist)])
+    gmsh.model.occ.synchronize()
+    # Mesh options
+    gmsh.model.mesh.generate(2)
+    node_tags, node_coords, _ = gmsh.model.mesh.getNodes()
+    verts = np.array(node_coords, dtype=np.float32).reshape(-1, 3)
+    elem_types, elem_tags, elem_node_tags = gmsh.model.mesh.getElements(dim=2)
+    faces = np.array(elem_node_tags[0], dtype=np.int32).reshape(-1, 3) - 1
+    gmsh.finalize()
+    return BasicTriMesh(verts, faces)
 
 
 # ---------------------------------------------------------------------------
@@ -387,10 +233,8 @@ class Skeleton:
         # pitch set to anatomical default after geometry is built (below)
 
         # ── local geometray ────────────────────────────────────────────────
-        (self._clavicle_l_v_local, self._clavicle_l_f_np,
-         self._clavicle_l_surf_idx) = _bone_capsule_verts_local()
-        (self._clavicle_r_v_local, self._clavicle_r_f_np,
-         self._clavicle_r_surf_idx) = _bone_capsule_verts_local()
+        self._clavicle_l = _clavicle_capsule_verts_local()
+        self._clavicle_r = _clavicle_capsule_verts_local()
 
         # ── fascia local geometry (left side, positive x) ──────────────────
         _FASCIA_ROWS = 6
@@ -428,9 +272,9 @@ class Skeleton:
 
         # ── Taichi fields ─────────────────────────────────────────────────
         self.clavicle_l_v,  self.clavicle_l_f  = _make_ti_mesh(
-            self._clavicle_l_v_local,  self._clavicle_l_f_np)
+            self._clavicle_l.verts,  self._clavicle_l.faces)
         self.clavicle_r_v,  self.clavicle_r_f  = _make_ti_mesh(
-            self._clavicle_r_v_local,  self._clavicle_r_f_np)
+            self._clavicle_r.verts,  self._clavicle_r.faces)
 
         # Fascia Taichi vertex fields (world space, updated each frame)
         n_fascia_l = len(self._fascia_l_v_local)
@@ -443,7 +287,7 @@ class Skeleton:
         self.fascia_r_f_ti.from_numpy(self._fascia_r_f_np.flatten().astype(np.int32))
 
         # world-space cache of left clavicle surface verts (for anchors)
-        self._clavicle_l_world = self._clavicle_l_v_local.copy()
+        self._clavicle_l_world = self._clavicle_l.verts.copy()
 
         # World-space caches for fascia
         self._fascia_l_world = self._fascia_l_v_local + self.chest_pos
@@ -452,12 +296,12 @@ class Skeleton:
         # ── upper-arm geometry (child of clavicle, pivot = GH joint) ──────────
         # Both arms share identical capsule geometry; right side mirrors x.
         # Local frame: y = 0 at shoulder (GH pivot), y = −length at elbow.
-        _ua_v, _ua_f = _upper_arm_capsule_verts_local()
-        self._upper_arm_l_v_local = _ua_v.copy()
-        self._upper_arm_r_v_local = _ua_v.copy()
-        self._upper_arm_r_v_local[:, 0] *= -1   # bilateral mirror around Y-Z plane
-        self._upper_arm_l_f_np = _ua_f
-        self._upper_arm_r_f_np = _ua_f            # same topology; two_sided rendering
+        _ua_l = _make_upper_arm_capsule()
+        _ua_r = _ua_l.mirrored_x()
+        self._upper_arm_l_v_local = _ua_l.verts
+        self._upper_arm_r_v_local = _ua_r.verts
+        self._upper_arm_l_f_np = _ua_l.faces
+        self._upper_arm_r_f_np = _ua_r.faces            # same topology; two_sided rendering
 
         # Glenohumeral DOF angles (in parent clavicle-local frame).
         # flexion  > 0 → arm swings anterior;  abduction > 0 → arm swings lateral.
@@ -494,10 +338,10 @@ class Skeleton:
         R_r = _rot_y(self.clavicle_right_yaw) @ _rot_z(-self.clavicle_right_pitch)
 
         self._clavicle_l_world = self._transform_verts(
-            self._clavicle_l_v_local, R_l, self._clavicle_l_offset)
+            self._clavicle_l.verts, R_l, self._clavicle_l_offset)
 
         # Right bone: flip x so it extends toward -x (right shoulder)
-        clavicle_r_local_mirrored = self._clavicle_r_v_local.copy()
+        clavicle_r_local_mirrored = self._clavicle_r.verts.copy()
         clavicle_r_local_mirrored[:, 0] *= -1
         self._clavicle_r_world = self._transform_verts(
             clavicle_r_local_mirrored, R_r, self._clavicle_r_offset)
@@ -637,11 +481,11 @@ class Skeleton:
     # ------------------------------------------------------------------
     def get_clavicle_left_surface_anchors_np(self):
         """World-space positions of the left clavicle surface vertices."""
-        return self.clavicle_l_v.to_numpy()[self._clavicle_l_surf_idx]   # (n_surf, 3)
+        return self.clavicle_l_v.to_numpy()#[self._clavicle_l_surf_idx]   # (n_surf, 3)
 
     def get_clavicle_right_surface_anchors_np(self):
         """World-space positions of the right clavicle surface vertices."""
-        return self.clavicle_r_v.to_numpy()[self._clavicle_r_surf_idx]   # (n_surf, 3)
+        return self.clavicle_r_v.to_numpy()#[self._clavicle_r_surf_idx]   # (n_surf, 3)
 
     def get_fascia_left_surface_anchors_np(self):
         """World-space positions of ALL left fascia vertices (used as ligament anchors)."""
@@ -657,13 +501,13 @@ class Skeleton:
 
     def get_clavicle_left_faces_np(self) -> np.ndarray:
         """Triangle face array (M, 3) for the left clavicle mesh."""
-        return self._clavicle_l_f_np
+        return self._clavicle_l.faces
 
     def get_clavicle_right_faces_np(self) -> np.ndarray:
         """Triangle face array (M, 3) for the right clavicle mesh.
         Indices reference the same vertex ordering as
         ``get_clavicle_right_world_np()`` (x-mirrored world positions)."""
-        return self._clavicle_r_f_np
+        return self._clavicle_r.faces
 
     def get_clavicle_right_world_np(self) -> np.ndarray:
         """World-space positions of ALL right clavicle vertices."""

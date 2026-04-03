@@ -16,8 +16,7 @@ ligaments resist elongation but offer no compression resistance.
 import taichi as ti
 import numpy as np
 
-from PBD_Taichi.cons.breast import Breast
-from PBD_Taichi.cons.torso import BreastRegion
+from PBD_Taichi.cons.breast import Breast, BreastRegion
 
 
 @ti.data_oriented
