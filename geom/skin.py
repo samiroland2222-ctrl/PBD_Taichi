@@ -30,8 +30,10 @@ from enum import IntEnum
 
 import numpy as np
 
+from PBD_Taichi.geom.obj import BoundBox3D
+
 try:
-    from PBD_Taichi.geom import gtet
+    from PBD_Taichi.geom import gtet, anatomy
 except ImportError:
     from geom import gtet
 
@@ -74,6 +76,72 @@ SkinShellData = namedtuple('SkinShellData', [
 # Public API
 # ---------------------------------------------------------------------------
 
+def _build_tagged_triangle_soup(
+        skeleton: anatomy.Skeleton,
+        meshes: tuple[str, np.ndarray, np.ndarray],
+) -> namedtuple[
+            'TaggedTriangleSoup',
+            ['verts', 'faces', 'tag', 'face_idx']
+            ]:
+    meshes = (meshes + [
+        ('clav_l', skeleton.get_clavicle_left_world_np(), skeleton.get_upper_arm_left_faces_np()),
+        ('clav_r', skeleton.get_clavicle_right_world_np(), skeleton.get_upper_arm_right_faces_np())
+        ('arm_l', skeleton.get_upper_arm_left_surface_np(), skeleton.get_upper_arm_left_faces_np()),
+        ('arm_r', skeleton.get_upper_arm_right_surface_np(), skeleton.get_upper_arm_right_faces_np()),
+    ])
+
+    soup_faces = []
+    #for tag, verts, faces in meshes:
+
+class Mesh:
+    vertices: np.ndarray # (N, 3) vertices
+    faces: np.ndarray # (N, 3) int indices
+
+
+def generate_skin_shell_new(
+    skeleton,
+    breast_l_verts: np.ndarray,
+    breast_r_verts: np.ndarray,
+    breast_l_faces: np.ndarray | None = None,
+    breast_r_faces: np.ndarray | None = None,
+    ribcage_verts: np.ndarray | None = None,
+    ribcage_faces: np.ndarray | None = None,
+    n_u: int = 20,
+    n_v: int = 30,
+    thickness: float = 0.005,
+    egg_depth: float = 0.15,
+    gap: float = 0.001,
+) -> SkinShellData:
+    """Generate the skin-shell tet mesh by outward raycasting
+
+    """
+
+    # build tagged triangle soup
+    _empty_f = np.zeros((0, 3), dtype=np.int32)
+    _empty_v = np.zeros((0, 3), dtype=np.float32)
+    soup_tris, soup_tags, soup_normals, soup_face_idx = _build_tagged_soup(
+        skeleton,
+        breast_l_verts,
+        breast_l_faces if breast_l_faces is not None else _empty_f,
+        breast_r_verts,
+        breast_r_faces if breast_r_faces is not None else _empty_f,
+        ribcage_verts if ribcage_verts is not None else _empty_v,
+        ribcage_faces if ribcage_faces is not None else _empty_f,
+    )
+    soup_min = soup_tris.reshape(-1, 3).min(axis=0)
+    soup_max = soup_tris.reshape(-1, 3).max(axis=0)
+
+    # start from a point in front of the chest
+    current_point = skeleton.center
+    while current_point.z < soup_max.z:
+        current_point += np.ndarray([0, 0, 1])
+
+    construction_queue = []
+    construction_queue.append((current_point, np.ndarray([0, 0, 1])))
+    while len(construction_queue) > 0:
+        current_point, current_normal = construction_queue.pop()
+        # project inwards until we intersect with a point in the triangle soup
+
 
 def generate_skin_shell(
         skeleton,
@@ -109,11 +177,8 @@ def generate_skin_shell(
     thickness : float  (metres)
         Shell thickness (skin + subcutaneous fat, typically 3–8 mm).
     egg_depth : float  (metres)
-        How far anterior of the deepest anatomy z-coordinate to place the
-        depth-map ray origins (i.e. the ``z_offset`` passed to
-        :func:`_build_depthmap_surface`).  0.10–0.15 m is a safe default.
-        (Formerly controlled the egg-ellipsoid protrusion depth; that code
-        has been replaced by the depth-map approach.)
+        How far the egg surface protrudes anteriorly from ``chest_pos[2]``.
+        Must exceed the most anterior z-coordinate of any anatomy mesh.
     gap : float  (metres)
         Outward offset applied to each ray-hit point before placing the
         inner vert – prevents geometry interpenetration (default 1 mm).
@@ -138,74 +203,84 @@ def generate_skin_shell(
     grid_x = np.linspace(-x_half, x_half, n_u, dtype=np.float32)
     grid_y = np.linspace(y_top,   y_bot,  n_v, dtype=np.float32)   # top→bottom
 
-    # ── 2. build tagged triangle soup ─────────────────────────────────────
-    #   Soup is needed before surface generation (depth-map uses it).
-    _empty_f = np.zeros((0, 3), dtype=np.int32)
-    _empty_v = np.zeros((0, 3), dtype=np.float32)
+    # ── 2. build egg surface (anterior half-ellipsoid) ────────────────────
+    y_c = float((y_top + y_bot) * 0.5)
+    a_x = float(x_half)
+    a_y = float((y_top - y_bot) * 0.5)
+    a_z = float(egg_depth)
+    z_c = float(cp[2])
 
-    soup_tris, soup_tags, soup_normals, soup_face_idx = _build_tagged_soup(
-        skeleton,
-        breast_l_verts,
-        breast_l_faces if breast_l_faces is not None else _empty_f,
-        breast_r_verts,
-        breast_r_faces if breast_r_faces is not None else _empty_f,
-        ribcage_verts  if ribcage_verts  is not None else _empty_v,
-        ribcage_faces  if ribcage_faces  is not None else _empty_f,
-    )
-    print(f"[SkinShell] triangle soup: {len(soup_tris)} tris "
-          f"from {len(np.unique(soup_tags))} anchor type(s)")
+    egg_pos, egg_normals = _build_egg_surface(
+        grid_x, grid_y, y_c, a_x, a_y, a_z, z_c)
+    # egg_pos:     (n_v, n_u, 3) float32 – world positions on the egg shell
+    # egg_normals: (n_v, n_u, 3) float32 – outward surface normals
 
-    # ── 3. build depth-map starting surface ───────────────────────────────
-    #   For each (x_i, y_j) grid column, rasterise the triangle soup in XY
-    #   and find the per-column z_max.  Ray origins are placed at
-    #   (x_i, y_j, z_col_max + egg_depth) and all rays shoot along [0,0,-1].
-    #   This replaces the old ellipsoid ("egg") prior with a surface that is
-    #   always anterior to the anatomy and axis-aligned for clean raycasting.
-    surf_pos, surf_normals = _build_depthmap_surface(
-        grid_x, grid_y, soup_tris, z_offset=egg_depth)
-    # surf_pos     : (n_v, n_u, 3) – ray start positions
-    # surf_normals : (n_v, n_u, 3) – all [0, 0, 1] (anterior)
+    debug_egg_surface = False
+    if debug_egg_surface:
+        verts = egg_pos.reshape((-1, 3)) + egg_normals.reshape((-1, 3)) * 0.01
+        n_inner = 0
+        anchor_type = None
+        inner_idx = None
+        outer_idx = None
+        anchor_target = None
+        anchor_bary_face = None
+        anchor_bary_uvw = None
+    else:
+        # ── 3. build tagged triangle soup ─────────────────────────────────────
+        _empty_f = np.zeros((0, 3), dtype=np.int32)
+        _empty_v = np.zeros((0, 3), dtype=np.float32)
 
-    # ── 4. ray-cast inward (−z) from every surface vertex ─────────────────
-    K        = n_u * n_v
-    ray_orig = surf_pos.reshape(K, 3)                                         # (K, 3)
-    ray_dir  = np.tile(np.array([[0.0, 0.0, -1.0]], dtype=np.float32), (K, 1))  # (K, 3)
+        soup_tris, soup_tags, soup_normals, soup_face_idx = _build_tagged_soup(
+            skeleton,
+            breast_l_verts,
+            breast_l_faces if breast_l_faces is not None else _empty_f,
+            breast_r_verts,
+            breast_r_faces if breast_r_faces is not None else _empty_f,
+            ribcage_verts  if ribcage_verts  is not None else _empty_v,
+            ribcage_faces  if ribcage_faces  is not None else _empty_f,
+        )
+        print(f"[SkinShell] triangle soup: {len(soup_tris)} tris "
+              f"from {len(np.unique(soup_tags))} anchor type(s)")
 
-    hit_t, hit_tri_soup, hit_u, hit_v = _cast_rays_inward(
-        ray_orig, ray_dir, soup_tris, soup_normals)
+        # ── 4. ray-cast inward from every egg vertex ───────────────────────────
+        K        = n_u * n_v
+        ray_orig = egg_pos.reshape(K, 3)          # (K, 3)
+        ray_dir  = (-egg_normals).reshape(K, 3)   # (K, 3) inward
 
-    # ── 5. place inner verts and fill anchor arrays (vectorised) ──────────
-    n_inner  = K
-    # Outward direction is always +z (anterior) for the depth-map approach.
-    outward  = np.tile(np.array([[0.0, 0.0, 1.0]], dtype=np.float32), (K, 1))  # (K, 3)
+        hit_t, hit_tri_soup, hit_u, hit_v = _cast_rays_inward(
+            ray_orig, ray_dir, soup_tris, soup_normals)
 
-    inner_pos        = ray_orig.copy().astype(np.float32)       # default: start surface
-    anchor_type      = np.full(n_inner, int(AnchorType.FREE),  dtype=np.int32)
-    anchor_target    = np.full(n_inner, -1,                    dtype=np.int32)  # deprecated
-    anchor_bary_face = np.full(n_inner, -1,                    dtype=np.int32)
-    anchor_bary_uvw  = np.zeros((n_inner, 3),                  dtype=np.float32)
+        # ── 5. place inner verts and fill anchor arrays (vectorised) ──────────
+        n_inner  = K
+        outward  = egg_normals.reshape(K, 3).astype(np.float32)  # (K, 3)
 
-    hit_mask = hit_tri_soup >= 0   # (K,)
-    if hit_mask.any():
-        hi      = np.where(hit_mask)[0]              # (H,) indices of hit verts
-        t_hi    = hit_t[hi, None]                    # (H, 1)
-        hit_pts = ray_orig[hi] + t_hi * ray_dir[hi]  # (H, 3) on anatomy surface
-        # push slightly outward (+z) by gap so skin does not interpenetrate anatomy
-        inner_pos[hi] = (hit_pts + gap * outward[hi]).astype(np.float32)
+        inner_pos        = ray_orig.copy().astype(np.float32)       # default: egg surface
+        anchor_type      = np.full(n_inner, int(AnchorType.FREE),  dtype=np.int32)
+        anchor_target    = np.full(n_inner, -1,                    dtype=np.int32)  # deprecated
+        anchor_bary_face = np.full(n_inner, -1,                    dtype=np.int32)
+        anchor_bary_uvw  = np.zeros((n_inner, 3),                  dtype=np.float32)
 
-        tri_idx              = hit_tri_soup[hi]       # (H,) soup triangle indices
-        anchor_type[hi]      = soup_tags[tri_idx]
-        anchor_bary_face[hi] = soup_face_idx[tri_idx]
+        hit_mask = hit_tri_soup >= 0   # (K,)
+        if hit_mask.any():
+            hi      = np.where(hit_mask)[0]              # (H,) indices of hit verts
+            t_hi    = hit_t[hi, None]                    # (H, 1)
+            hit_pts = ray_orig[hi] + t_hi * ray_dir[hi]  # (H, 3) on anatomy surface
+            # push slightly outward by gap so skin does not interpenetrate anatomy
+            inner_pos[hi] = (hit_pts + gap * outward[hi]).astype(np.float32)
 
-        u_hi = hit_u[hi]; v_hi = hit_v[hi]
-        anchor_bary_uvw[hi, 0] = 1.0 - u_hi - v_hi  # w  (weight for face vertex 0)
-        anchor_bary_uvw[hi, 1] = u_hi                # u  (weight for face vertex 1)
-        anchor_bary_uvw[hi, 2] = v_hi                # v  (weight for face vertex 2)
+            tri_idx              = hit_tri_soup[hi]       # (H,) soup triangle indices
+            anchor_type[hi]      = soup_tags[tri_idx]
+            anchor_bary_face[hi] = soup_face_idx[tri_idx]
 
-    # ── 6. single-layer vertex array (no extrusion yet) ──────────────────
-    verts     = inner_pos.astype(np.float32)          # (n_inner, 3)
-    inner_idx = np.arange(n_inner, dtype=np.int32)
-    outer_idx = np.arange(n_inner, dtype=np.int32)    # same layer – no outer yet
+            u_hi = hit_u[hi]; v_hi = hit_v[hi]
+            anchor_bary_uvw[hi, 0] = 1.0 - u_hi - v_hi  # w  (weight for face vertex 0)
+            anchor_bary_uvw[hi, 1] = u_hi                # u  (weight for face vertex 1)
+            anchor_bary_uvw[hi, 2] = v_hi                # v  (weight for face vertex 2)
+
+        # ── 6. single-layer vertex array (no extrusion yet) ──────────────────
+        verts     = inner_pos.astype(np.float32)          # (n_inner, 3)
+        inner_idx = np.arange(n_inner, dtype=np.int32)
+        outer_idx = np.arange(n_inner, dtype=np.int32)    # same layer – no outer yet
 
     # ── 7. grid quads → triangle surface mesh ─────────────────────────────
     tris: list[list[int]] = []
@@ -221,8 +296,8 @@ def generate_skin_shell(
 
     n_tris = len(tris)
     print(f"[SkinShell] {n_inner} verts, {n_tris} tris (single-layer surface), "
-          f"grid {n_u}×{n_v}")
-    if anchor_type is not None:
+          f"grid {n_u}×{n_v}")#  ({n_hits}/{n_inner} anchored by raycast)")
+    if anchor_type:
         _print_anchor_stats(anchor_type)
 
     return SkinShellData(
@@ -291,110 +366,6 @@ def _build_egg_surface(
 
     egg_normals = np.stack([nx, ny, nz], axis=-1)   # (n_v, n_u, 3)
     return egg_pos, egg_normals
-
-
-def _build_depthmap_surface(
-    grid_x: np.ndarray,    # (n_u,)  ascending
-    grid_y: np.ndarray,    # (n_v,)  may be descending (superior → inferior)
-    soup_tris: np.ndarray, # (T, 3, 3) float32
-    z_offset: float = 0.05,
-) -> tuple[np.ndarray, np.ndarray]:
-    """Build the anterior depth-map starting surface for shrinkwrap raycasting.
-
-    For each ``(x_i, y_j)`` grid column, rasterises the triangle soup onto the
-    grid in the XY plane and records the maximum z of any triangle that covers
-    that column.  The ray origin is placed at
-    ``(x_i, y_j, z_col_max + z_offset)`` and all ray directions are
-    ``[0, 0, −1]`` (shooting posteriorly).
-
-    Grid columns with no triangle coverage fall back to the global z maximum
-    so that every ray still has a valid (if slightly conservative) start.
-
-    Parameters
-    ----------
-    grid_x, grid_y : 1-D float32 arrays
-        Grid axis coordinates.  ``grid_y`` may be descending.
-    soup_tris : (T, 3, 3) float32
-        Triangle vertex array from :func:`_build_tagged_soup`.
-    z_offset : float
-        How far anterior of the deepest anatomy z-coordinate to start each ray.
-        A value of 0.05–0.15 m is typically sufficient.
-
-    Returns
-    -------
-    surf_pos : (n_v, n_u, 3) float32
-        Ray origins; z component equals per-column z_max + z_offset.
-    surf_normals : (n_v, n_u, 3) float32
-        Outward unit normals – all ``[0, 0, 1]`` (anterior).
-    """
-    n_u = len(grid_x)
-    n_v = len(grid_y)
-    z_max_grid = np.full((n_v, n_u), -np.inf, dtype=np.float64)
-
-    if len(soup_tris) > 0:
-        global_z_max = float(soup_tris.reshape(-1, 3)[:, 2].max())
-
-        for tri in soup_tris:
-            A, B, C = tri[0], tri[1], tri[2]
-            ax, ay, az = float(A[0]), float(A[1]), float(A[2])
-            bx, by, bz = float(B[0]), float(B[1]), float(B[2])
-            cx, cy, cz = float(C[0]), float(C[1]), float(C[2])
-
-            # --- XY bounding box; clip to grid extent -------------------------
-            x_lo = min(ax, bx, cx);  x_hi = max(ax, bx, cx)
-            y_lo = min(ay, by, cy);  y_hi = max(ay, by, cy)
-
-            # grid_x is ascending – use searchsorted
-            i_lo = max(0, int(np.searchsorted(grid_x, x_lo, 'left'))  - 1)
-            i_hi = min(n_u - 1, int(np.searchsorted(grid_x, x_hi, 'right')))
-            if i_lo > i_hi:
-                continue
-
-            # grid_y may be descending – use a boolean mask
-            j_ids = np.where((grid_y >= y_lo) & (grid_y <= y_hi))[0]
-            if len(j_ids) == 0:
-                continue
-            j_lo, j_hi = int(j_ids[0]), int(j_ids[-1])
-
-            # --- vectorised 2-D barycentric test over the sub-grid patch ------
-            gx_patch = grid_x[i_lo:i_hi + 1]   # (ni,)
-            gy_patch = grid_y[j_lo:j_hi + 1]   # (nj,)
-            GX, GY = np.meshgrid(gx_patch, gy_patch)  # (nj, ni)
-
-            e1x, e1y = bx - ax, by - ay
-            e2x, e2y = cx - ax, cy - ay
-            denom = e1x * e2y - e1y * e2x
-            if abs(denom) < 1e-12:
-                continue   # degenerate triangle in XY projection
-
-            epx = GX - ax   # (nj, ni)
-            epy = GY - ay
-            u = (epx * e2y - epy * e2x) / denom
-            v = (e1x * epy - e1y * epx) / denom
-
-            inside = (u >= -1e-6) & (v >= -1e-6) & (u + v <= 1.0 + 1e-6)
-            z_interp = az + u * (bz - az) + v * (cz - az)  # (nj, ni)
-
-            patch = z_max_grid[j_lo:j_hi + 1, i_lo:i_hi + 1]
-            z_max_grid[j_lo:j_hi + 1, i_lo:i_hi + 1] = np.where(
-                inside, np.maximum(patch, z_interp), patch)
-
-        # Columns not covered by any triangle fall back to the global max
-        z_max_grid = np.where(np.isinf(z_max_grid), global_z_max, z_max_grid)
-    else:
-        z_max_grid[:] = 0.0
-
-    z_start  = (z_max_grid + z_offset).astype(np.float32)
-    X, Y     = np.meshgrid(grid_x.astype(np.float32),
-                           grid_y.astype(np.float32))   # both (n_v, n_u)
-    surf_pos = np.stack([X, Y, z_start], axis=-1)       # (n_v, n_u, 3)
-
-    surf_normals = np.zeros_like(surf_pos)
-    surf_normals[:, :, 2] = 1.0   # all normals point anteriorly (+z)
-
-    return surf_pos, surf_normals
-
-
 
 
 def _build_tagged_soup(
