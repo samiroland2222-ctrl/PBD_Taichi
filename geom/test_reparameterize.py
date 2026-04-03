@@ -38,7 +38,7 @@ import numpy as np
 import pytest
 
 from PBD_Taichi.geom.distance_field import (
-    Mesh,
+    BasicTriMesh,
     _surface_area,
     _target_edge_len,
     _remesh_surface,
@@ -87,16 +87,16 @@ def _subdivide_once(verts: np.ndarray, faces: np.ndarray):
     return np.array(new_verts, dtype=np.float64), np.array(new_faces, dtype=np.int32)
 
 
-def make_smooth_mesh(subdivisions: int = 2) -> Mesh:
+def make_smooth_mesh(subdivisions: int = 2) -> BasicTriMesh:
     """Unit-sphere-projected octahedron; 8·4^subdivisions faces."""
     v, f = _OCTA_VERTS.copy(), _OCTA_FACES.copy()
     for _ in range(subdivisions):
         v, f = _subdivide_once(v, f)
-    return Mesh(verts=v, faces=f)
+    return BasicTriMesh(verts=v, faces=f)
 
 
 def make_star_prism(n_points: int = 5, outer_r: float = 1.0,
-                    inner_r: float = 0.4, height: float = 0.5) -> Mesh:
+                    inner_r: float = 0.4, height: float = 0.5) -> BasicTriMesh:
     """Star-shaped prism with sharp concave valleys (same as test_boundary_layer)."""
     n = n_points * 2
     angles = np.linspace(0, 2 * np.pi, n, endpoint=False)
@@ -111,7 +111,7 @@ def make_star_prism(n_points: int = 5, outer_r: float = 1.0,
     for i in range(n):
         j = (i + 1) % n
         faces += [[bc, j, i], [tc, n + i, n + j], [i, j, n + j], [i, n + j, n + i]]
-    return Mesh(
+    return BasicTriMesh(
         verts=np.asarray(verts, dtype=np.float64),
         faces=np.asarray(faces, dtype=np.int32),
     )
@@ -139,15 +139,15 @@ class TestHelpers:
 
     def test_surface_area_unit_octahedron(self):
         """8 equilateral triangles with edge √2 → total area 4√3."""
-        mesh = Mesh(verts=_OCTA_VERTS, faces=_OCTA_FACES)
+        mesh = BasicTriMesh(verts=_OCTA_VERTS, faces=_OCTA_FACES)
         expected = 4.0 * np.sqrt(3.0)
         assert abs(_surface_area(mesh) - expected) < 1e-9
 
     def test_surface_area_scales_with_uniform_scale(self):
         """Scaling verts by s → area scales by s²."""
         s = 3.0
-        mesh_1 = Mesh(verts=_OCTA_VERTS,       faces=_OCTA_FACES)
-        mesh_s = Mesh(verts=_OCTA_VERTS * s,   faces=_OCTA_FACES)
+        mesh_1 = BasicTriMesh(verts=_OCTA_VERTS, faces=_OCTA_FACES)
+        mesh_s = BasicTriMesh(verts=_OCTA_VERTS * s, faces=_OCTA_FACES)
         assert abs(_surface_area(mesh_s) / _surface_area(mesh_1) - s ** 2) < 1e-9
 
     def test_target_edge_len_inverse_sqrt_of_target(self):
@@ -160,8 +160,8 @@ class TestHelpers:
     def test_target_edge_len_proportional_to_sqrt_area(self):
         """e ∝ √area: scaling surface by s² → e scales by s."""
         s = 2.0
-        mesh_1 = Mesh(verts=_OCTA_VERTS,       faces=_OCTA_FACES)
-        mesh_s = Mesh(verts=_OCTA_VERTS * s,   faces=_OCTA_FACES)
+        mesh_1 = BasicTriMesh(verts=_OCTA_VERTS, faces=_OCTA_FACES)
+        mesh_s = BasicTriMesh(verts=_OCTA_VERTS * s, faces=_OCTA_FACES)
         e1 = _target_edge_len(mesh_1, 600, 1)
         es = _target_edge_len(mesh_s, 600, 1)
         assert abs(es / e1 - s) < 1e-6
@@ -192,7 +192,7 @@ class TestRemeshSurface:
     def test_output_is_valid_mesh(self):
         e = _target_edge_len(self.mesh, 400, 1)
         result = _remesh_surface(self.mesh, e)
-        assert isinstance(result, Mesh)
+        assert isinstance(result, BasicTriMesh)
         assert result.verts.ndim == 2 and result.verts.shape[1] == 3
         assert result.faces.ndim == 2 and result.faces.shape[1] == 3
         assert result.verts.dtype == np.float64

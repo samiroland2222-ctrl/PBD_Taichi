@@ -2,13 +2,13 @@ import gmsh
 import numpy as np
 
 
-class Mesh:
+class BasicTriMesh:
     def __init__(self, verts: np.ndarray, faces: np.ndarray):
         self.verts = verts
         self.faces = faces
 
 
-class TetMesh:
+class BasicTetMesh:
     def __init__(self, verts: np.ndarray, tets: np.ndarray):
         self.verts = verts  # (N, 3) float64
         self.tets = tets    # (M, 4) int32, 0-indexed
@@ -16,7 +16,7 @@ class TetMesh:
 
 # ── private helpers ────────────────────────────────────────────────────────────
 
-def _surface_area(mesh: Mesh) -> float:
+def _surface_area(mesh: BasicTriMesh) -> float:
     """Total surface area of a triangle mesh."""
     a = mesh.verts[mesh.faces[:, 0]]
     b = mesh.verts[mesh.faces[:, 1]]
@@ -24,7 +24,7 @@ def _surface_area(mesh: Mesh) -> float:
     return 0.5 * np.linalg.norm(np.cross(b - a, c - a), axis=1).sum()
 
 
-def _target_edge_len(mesh: Mesh, target_tet_count: int, n_layers: int) -> float:
+def _target_edge_len(mesh: BasicTriMesh, target_tet_count: int, n_layers: int) -> float:
     """Characteristic edge length that yields ~``target_tet_count`` tetrahedra.
 
     Equilateral-triangle packing:
@@ -35,7 +35,7 @@ def _target_edge_len(mesh: Mesh, target_tet_count: int, n_layers: int) -> float:
     return float(np.sqrt(12.0 * n_layers * area / (np.sqrt(3.0) * target_tet_count)))
 
 
-def _remesh_surface(mesh: Mesh, target_edge_len: float) -> Mesh:
+def _remesh_surface(mesh: BasicTriMesh, target_edge_len: float) -> BasicTriMesh:
     """Isotropic remesh to approximately ``target_edge_len`` using pymeshlab.
 
     Uses two passes with a correction step:
@@ -72,13 +72,13 @@ def _remesh_surface(mesh: Mesh, target_edge_len: float) -> Mesh:
         e_corrected = target_edge_len * np.sqrt(n_tri_actual / n_tri_target)
         v1, f1 = _do_remesh(v1, f1, float(e_corrected))
 
-    return Mesh(
+    return BasicTriMesh(
         verts=np.asarray(v1, dtype=np.float64),
         faces=np.asarray(f1, dtype=np.int32),
     )
 
 
-def _vertex_normals(mesh: Mesh) -> np.ndarray:
+def _vertex_normals(mesh: BasicTriMesh) -> np.ndarray:
     """Per-vertex outward normals: area-weighted average, unit-normalised."""
     verts, faces = mesh.verts, mesh.faces
     n = np.zeros_like(verts)
@@ -93,7 +93,7 @@ def _vertex_normals(mesh: Mesh) -> np.ndarray:
     return np.where(norms > 0, n / norms, 0.0)
 
 
-def _extrude_to_tets(mesh: Mesh, heights: list[float], debug_save_path: str|None=None) -> TetMesh:
+def _extrude_to_tets(mesh: BasicTriMesh, heights: list[float], debug_save_path: str | None=None) -> BasicTetMesh:
     """Pure-numpy boundary layer extrusion along vertex normals.
 
     Vertex layout: [base, layer_0, layer_1, ..., layer_{N-1}]
@@ -118,7 +118,7 @@ def _extrude_to_tets(mesh: Mesh, heights: list[float], debug_save_path: str|None
         all_tets.append(np.stack([v0, v1, v5, v4], axis=1))
         all_tets.append(np.stack([v0, v4, v5, v3], axis=1))
 
-    mesh = TetMesh(
+    mesh = BasicTetMesh(
         verts=all_verts.astype(np.float64),
         tets=np.concatenate(all_tets, axis=0).astype(np.int32),
     )
@@ -147,7 +147,7 @@ def _extrude_to_tets(mesh: Mesh, heights: list[float], debug_save_path: str|None
 
 # ── public API ─────────────────────────────────────────────────────────────────
 
-def boolean_merge_meshes(meshes: list[Mesh]) -> Mesh:
+def boolean_merge_meshes(meshes: list[BasicTriMesh]) -> BasicTriMesh:
 
     gmsh.initialize()
     gmsh.model.add("boolean_merge")
@@ -192,16 +192,16 @@ def boolean_merge_meshes(meshes: list[Mesh]) -> Mesh:
 
     gmsh.finalize()
 
-    return Mesh(verts=verts, faces=faces)
+    return BasicTriMesh(verts=verts, faces=faces)
 
 
 def build_boundary_layer(
-    surface_mesh: Mesh,
+    surface_mesh: BasicTriMesh,
     layer_thickness: float,
     reparamterize_target_tet_count: int | None = None,
     remesh_surface: bool = False,
     debug_save_path: str | None = None,
-) -> TetMesh:
+) -> BasicTetMesh:
     """Build a tetrahedral boundary layer that skins the provided surface mesh.
 
     Uses gmsh's built-in ``extrudeBoundaryLayer`` to extrude the surface
@@ -211,7 +211,7 @@ def build_boundary_layer(
 
     Parameters
     ----------
-    surface_mesh : Mesh
+    surface_mesh : BasicTriMesh
         Triangulated surface mesh.
     layer_thickness : float
         Total thickness of the boundary layer.
@@ -238,7 +238,7 @@ def build_boundary_layer(
 
     Returns
     -------
-    TetMesh
+    BasicTetMesh
         Tetrahedral mesh of the boundary-layer region.
     """
     # ── layer height schedule (geometric progression) ─────────────────────────
@@ -329,5 +329,5 @@ def build_boundary_layer(
         gmsh.write(debug_save_path)
 
     gmsh.finalize()
-    return TetMesh(verts=verts_out, tets=tets_out)
+    return BasicTetMesh(verts=verts_out, tets=tets_out)
 

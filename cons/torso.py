@@ -5,12 +5,14 @@ fat shell into a single TetMesh driven by one XPBD framework.
 import numpy as np
 import taichi as ti
 
+from PBD_Taichi.geom.distance_field import BasicTetMesh
+
 try:
     from PBD_Taichi.cons import framework, deform3d, coopers, skin_anchor
     from PBD_Taichi.cons.breast import Breast
     from PBD_Taichi.cons.skin_anchor import BaryBreastSkinConstraint, KinematicSkinSpringConstraint
     from PBD_Taichi.geom import gtet, skin as skin_mod
-    from PBD_Taichi.geom.skin import AnchorType
+    from PBD_Taichi.geom.skin import AnchorType, BarycentricBindingDefinition
 except ImportError:
     from cons import framework, deform3d, coopers, skin_anchor
     from cons.breast import Breast
@@ -66,11 +68,8 @@ class UnifiedTorso:
         rng=None,
         ribcage_verts_np=None,
         ribcage_faces_np=None,
-        skin_n_u=20,
-        skin_n_v=30,
-        skin_thickness=0.005,
-        skin_egg_depth=0.15,
-        skin_gap=0.001,
+        skin_target_n_tets=1000,
+        skin_thickness=0.01,
         arm_init_abduction=0.4,   # radians – A-pose for skin shell init
         g=(0.0, -9.8, 0.0),
         dt=None,
@@ -120,7 +119,7 @@ class UnifiedTorso:
 
         breast_l_outer = v_l[top_l]  # kept for compatibility (not used in skin shell)
         breast_r_outer = v_r[top_r]
-        shell = skin_mod.generate_skin_shell(
+        skin_shell, barycentric_bindings = skin_mod.generate_skin_shell(
             skeleton,
             breast_l_verts=v_l,
             breast_l_faces=f_l.reshape(-1, 3),
@@ -130,14 +129,11 @@ class UnifiedTorso:
             ribcage_faces=(ribcage_faces_np
                            if ribcage_faces_np is not None
                            else skeleton.get_ribcage_faces_np()),
-            n_u=skin_n_u, n_v=skin_n_v,
+            target_n_tets=skin_target_n_tets,
             thickness=skin_thickness,
-            egg_depth=skin_egg_depth,
-            gap=skin_gap,
         )
-        self.shell = shell
-        self.n_skin_verts = len(shell.verts)
-        self.n_skin_tets  = 0   # no tets yet – single-surface mode
+        self.skin_shell: BasicTetMesh = skin_shell
+        self.barycentric_bindings: list[BarycentricBindingDefinition] = barycentric_bindings
 
         # ── 3. merge breast meshes only (skin is visual-only for now) ─────
         merged_v, merged_t, merged_f = gtet.merge_numpy(
@@ -226,8 +222,7 @@ class UnifiedTorso:
         # ── 8. init rest status ───────────────────────────────────────────
         self.xpbd.init_rest_status()
         print(f"[UnifiedTorso] {self.mesh.n_vert} verts, {self.mesh.n_tet} tets  "
-              f"(L={self.n_left_tets} R={self.n_right_tets})  "
-              f"skin surface: {self.n_skin_verts} verts (visual only)")
+              f"(L={self.n_left_tets} R={self.n_right_tets})  ")
 
     # ------------------------------------------------------------------
     # Skin kinematic update – no-op until skin is brought into simulation

@@ -30,12 +30,10 @@ from enum import IntEnum
 
 import numpy as np
 
+from PBD_Taichi.geom.distance_field import BasicTetMesh
 from PBD_Taichi.geom.obj import BoundBox3D
-
-try:
-    from PBD_Taichi.geom import gtet, anatomy
-except ImportError:
-    from geom import gtet
+from PBD_Taichi.geom import distance_field as df
+from PBD_Taichi.geom import gtet, anatomy
 
 
 # ---------------------------------------------------------------------------
@@ -52,24 +50,6 @@ class AnchorType(IntEnum):
     ARM_R      = 6
     RIBCAGE    = 7
 
-
-# ---------------------------------------------------------------------------
-# Return type
-# ---------------------------------------------------------------------------
-
-SkinShellData = namedtuple('SkinShellData', [
-    'verts',           # (n_verts, 3)   float32
-    'tets_flat',       # (n_tets*4,)    int32  – flat tet indices
-    'faces_flat',      # (n_faces*3,)   int32  – flat surface-triangle indices
-    'n_u',             # int – grid columns
-    'n_v',             # int – grid rows
-    'inner_idx',       # (n_u*n_v,)     int32  – global vertex indices of inner layer
-    'outer_idx',       # (n_u*n_v,)     int32  – global vertex indices of outer layer
-    'anchor_type',     # (n_u*n_v,)     int32  – AnchorType per inner vert
-    'anchor_target',   # (n_u*n_v,)     int32  – DEPRECATED (always -1, kept for compat)
-    'anchor_bary_face',  # (n_u*n_v,)   int32  – triangle idx in anchor mesh (-1 if FREE)
-    'anchor_bary_uvw',   # (n_u*n_v, 3) float32 – barycentric coords for ALL non-FREE types
-])
 
 
 # ---------------------------------------------------------------------------
@@ -97,8 +77,20 @@ class Mesh:
     vertices: np.ndarray # (N, 3) vertices
     faces: np.ndarray # (N, 3) int indices
 
+class BarycentricBindingDefinition:
+    """
+    Defines a spring binding between a vertex on the skin tetra mesh and a given anchor triangle on a given driving
+    (kinematic, deformaable) mesh.
+    The triangle end of the spring is bound to the triangle using barycentric coordinates with a distance offset.
+    """
+    anchor_type: AnchorType
+    anchor_bary_face: np.ndarray  # vertex indices on the mesh indicated by anchor_type
+    anchor_bary_uvw: np.ndarray   # barycentric UVW
+    skin_vertex_index: int        # index of the vertex on the skin shell tetra mesh
+    skin_vertex_distance: float   # offset distance from the anchor triangle (spring length at initial pos)
 
-def generate_skin_shell_new(
+
+def generate_skin_shell(
     skeleton,
     breast_l_verts: np.ndarray,
     breast_r_verts: np.ndarray,
@@ -106,44 +98,107 @@ def generate_skin_shell_new(
     breast_r_faces: np.ndarray | None = None,
     ribcage_verts: np.ndarray | None = None,
     ribcage_faces: np.ndarray | None = None,
-    n_u: int = 20,
-    n_v: int = 30,
+    target_n_tets: int = 600,
     thickness: float = 0.005,
-    egg_depth: float = 0.15,
-    gap: float = 0.001,
-) -> SkinShellData:
-    """Generate the skin-shell tet mesh by outward raycasting
+) -> tuple[BasicTetMesh, list[BarycentricBindingDefinition]]:
 
-    """
-
-    # build tagged triangle soup
     _empty_f = np.zeros((0, 3), dtype=np.int32)
-    _empty_v = np.zeros((0, 3), dtype=np.float32)
-    soup_tris, soup_tags, soup_normals, soup_face_idx = _build_tagged_soup(
-        skeleton,
-        breast_l_verts,
-        breast_l_faces if breast_l_faces is not None else _empty_f,
-        breast_r_verts,
-        breast_r_faces if breast_r_faces is not None else _empty_f,
-        ribcage_verts if ribcage_verts is not None else _empty_v,
-        ribcage_faces if ribcage_faces is not None else _empty_f,
+    _empty_v = np.zeros((0, 3), dtype=np.float64)
+
+    # ── collect skeleton surfaces ──────────────────────────────────────────
+    clav_l_v = np.asarray(skeleton.get_clavicle_left_world_np(),     dtype=np.float64)
+    clav_r_v = np.asarray(skeleton.get_clavicle_right_world_np(),    dtype=np.float64)
+    arm_l_v  = np.asarray(skeleton.get_upper_arm_left_surface_np(),  dtype=np.float64)
+    arm_r_v  = np.asarray(skeleton.get_upper_arm_right_surface_np(), dtype=np.float64)
+    clav_l_f = np.asarray(skeleton.get_clavicle_left_faces_np(),     dtype=np.int32).reshape(-1, 3)
+    clav_r_f = np.asarray(skeleton.get_clavicle_right_faces_np(),    dtype=np.int32).reshape(-1, 3)
+    arm_l_f  = np.asarray(skeleton.get_upper_arm_left_faces_np(),    dtype=np.int32).reshape(-1, 3)
+    arm_r_f  = np.asarray(skeleton.get_upper_arm_right_faces_np(),   dtype=np.int32).reshape(-1, 3)
+
+    bl_v = np.asarray(breast_l_verts, dtype=np.float64)
+    br_v = np.asarray(breast_r_verts, dtype=np.float64)
+    bl_f = np.asarray(breast_l_faces, dtype=np.int32).reshape(-1, 3) if breast_l_faces is not None else _empty_f
+    br_f = np.asarray(breast_r_faces, dtype=np.int32).reshape(-1, 3) if breast_r_faces is not None else _empty_f
+    rc_v = np.asarray(ribcage_verts,  dtype=np.float64) if ribcage_verts is not None else _empty_v
+    rc_f = np.asarray(ribcage_faces,  dtype=np.int32).reshape(-1, 3) if ribcage_faces is not None else _empty_f
+
+    # ── 1. Boolean merge all anatomy meshes → merged_surface ──────────────
+    merge_inputs: list[df.BasicTriMesh] = []
+    for v, f in [
+        (clav_l_v, clav_l_f), (clav_r_v, clav_r_f),
+        (arm_l_v,  arm_l_f),  (arm_r_v,  arm_r_f),
+        (rc_v,     rc_f),     (bl_v,     bl_f),
+        (br_v,     br_f),
+    ]:
+        if len(v) > 0 and len(f) > 0:
+            merge_inputs.append(df.BasicTriMesh(verts=v, faces=f))
+
+    if not merge_inputs:
+        raise ValueError("No input meshes found.")
+
+    print(f"[generate_skin_shell] Boolean-merging {len(merge_inputs)} anatomy meshes…")
+    merged_surface = df.boolean_merge_meshes(merge_inputs)
+    print(f"[generate_skin_shell] Merged surface: {len(merged_surface.verts)} verts, "
+          f"{len(merged_surface.faces)} faces")
+
+    # ── 2. Build skin shell as a single-layer tetrahedral boundary layer ───
+    # Option C (remesh_surface=True): pymeshlab isotropic remesh + pure-numpy
+    # prism extrusion gives an exact tet count and a guaranteed vertex layout:
+    #   verts[0 : n_v]        → inner layer (anatomy-facing, on merged_surface)
+    #   verts[n_v : 2*n_v]    → outer layer (offset by thickness)
+    # where N=1 is hardcoded in build_boundary_layer.
+    print(f"[generate_skin_shell] Building boundary layer "
+          f"(target_n_tets={target_n_tets}, thickness={thickness})…")
+    shell = df.build_boundary_layer(
+        merged_surface,
+        layer_thickness=thickness,
+        reparamterize_target_tet_count=target_n_tets,
+        remesh_surface=True,
     )
-    soup_min = soup_tris.reshape(-1, 3).min(axis=0)
-    soup_max = soup_tris.reshape(-1, 3).max(axis=0)
+    n_v         = len(shell.verts) // 2   # N=1 → two equal rings
+    inner_verts = shell.verts[:n_v]       # (n_v, 3) – on the merged-surface side
+    print(f"[generate_skin_shell] Shell: {len(shell.verts)} verts ({n_v} inner), "
+          f"{len(shell.tets)} tets")
 
-    # start from a point in front of the chest
-    current_point = skeleton.center
-    while current_point.z < soup_max.z:
-        current_point += np.ndarray([0, 0, 1])
+    # ── 3. Build per-inner-vertex BarycentricBindings ─────────────────────
+    # Flatten all anatomy meshes into a tagged triangle soup so that for each
+    # inner vertex we can find both the nearest triangle *and* which anatomy
+    # mesh it belongs to (AnchorType), plus its local face index.
+    soup_tris, soup_tags, _, soup_face_idx = _build_tagged_soup(
+        skeleton,
+        bl_v.astype(np.float32), bl_f,
+        br_v.astype(np.float32), br_f,
+        rc_v.astype(np.float32), rc_f,
+    )
 
-    construction_queue = []
-    construction_queue.append((current_point, np.ndarray([0, 0, 1])))
-    while len(construction_queue) > 0:
-        current_point, current_normal = construction_queue.pop()
-        # project inwards until we intersect with a point in the triangle soup
+    bindings: list[BarycentricBindingDefinition] = []
+
+    if len(soup_tris) == 0:
+        print("[generate_skin_shell] Warning: empty tagged soup – no bindings produced.")
+        return bindings
+
+    best_tri_arr, best_uvw_arr, best_dist_arr = _batch_closest_triangles(
+        inner_verts.astype(np.float64), soup_tris,
+    )
+
+    for vi in range(n_v):
+        ti = int(best_tri_arr[vi])
+        b = BarycentricBindingDefinition()
+        b.anchor_type          = AnchorType(int(soup_tags[ti]))
+        b.anchor_bary_face     = int(soup_face_idx[ti])
+        b.anchor_bary_uvw      = best_uvw_arr[vi].astype(np.float32)  # (w_A, w_B, w_C)
+        b.skin_vertex_index    = vi
+        b.skin_vertex_distance = float(best_dist_arr[vi])
+        bindings.append(b)
+
+    print(f"[generate_skin_shell] {len(bindings)} bindings produced.")
+    _print_anchor_stats(np.array([int(b.anchor_type) for b in bindings], dtype=np.int32))
+
+    # ── 4. Return the bindings ─────────────────────────────────────────────
+    return shell, bindings
 
 
-def generate_skin_shell(
+def generate_skin_shell_archaic_method(
         skeleton,
         breast_l_verts: np.ndarray,
         breast_r_verts: np.ndarray,
@@ -518,6 +573,106 @@ def _print_anchor_stats(anchor_type: np.ndarray) -> None:
         n = int((anchor_type == at).sum())
         if n > 0:
             print(f"  {at.name:14s}: {n}")
+
+
+def _batch_closest_triangles(
+    points: np.ndarray,     # (K, 3) float64 – query points
+    soup_tris: np.ndarray,  # (T, 3, 3) float32 – triangle soup
+) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    """Vectorised Ericson closest-point-on-triangle search.
+
+    For each of the K points finds the closest triangle in the T-triangle
+    soup using the Christer Ericson vertex / edge / face region algorithm
+    (Real-Time Collision Detection §5.1.5), vectorised over T for each query.
+
+    Vertex regions have the highest priority (applied last, overwriting edge
+    and interior results) to match the original if-elif chain.
+
+    Returns
+    -------
+    best_tri  : (K,)    int32   – index of nearest soup triangle
+    best_uvw  : (K, 3)  float32 – barycentric weights (w_A, w_B, w_C)
+    best_dist : (K,)    float32 – Euclidean distance to nearest point
+    """
+    K = len(points)
+    T = len(soup_tris)
+
+    best_tri  = np.zeros(K,       dtype=np.int32)
+    best_uvw  = np.full((K, 3), 1.0 / 3.0, dtype=np.float32)
+    best_dist = np.full(K, np.inf, dtype=np.float64)
+
+    if T == 0:
+        return best_tri, best_uvw, best_dist.astype(np.float32)
+
+    A  = soup_tris[:, 0, :].astype(np.float64)  # (T, 3)
+    B  = soup_tris[:, 1, :].astype(np.float64)
+    C  = soup_tris[:, 2, :].astype(np.float64)
+    AB = B - A   # (T, 3)
+    AC = C - A
+
+    for k in range(K):
+        P  = points[k].astype(np.float64)        # (3,)
+        AP = P - A;  BP = P - B;  CP = P - C     # (T, 3) each
+
+        d1 = np.einsum('ti,ti->t', AB, AP)
+        d2 = np.einsum('ti,ti->t', AC, AP)
+        d3 = np.einsum('ti,ti->t', AB, BP)
+        d4 = np.einsum('ti,ti->t', AC, BP)
+        d5 = np.einsum('ti,ti->t', AB, CP)
+        d6 = np.einsum('ti,ti->t', AC, CP)
+
+        # Voronoi region scalars
+        va = d3 * d6 - d5 * d4
+        vb = d5 * d2 - d1 * d6
+        vc = d1 * d4 - d3 * d2
+
+        # Interior barycentric (initialise; region masks overwrite below)
+        denom = va + vb + vc
+        inv_d = np.where(np.abs(denom) > 1e-12, 1.0 / denom, 0.0)
+        u = 1.0 - (vb + vc) * inv_d   # w_A
+        v = vb * inv_d                 # w_B
+        w = vc * inv_d                 # w_C
+
+        # ── edge regions (lower priority than vertices) ───────────────────
+        # Edge AB: vc <= 0, d1 >= 0, d3 <= 0
+        m = (vc <= 0) & (d1 >= 0) & (d3 <= 0)
+        if m.any():
+            den = d1[m] - d3[m]
+            t_  = np.clip(np.where(den > 1e-12, d1[m] / den, 0.0), 0.0, 1.0)
+            u[m] = 1.0 - t_;  v[m] = t_;  w[m] = 0.0
+
+        # Edge AC: vb <= 0, d2 >= 0, d6 <= 0
+        m = (vb <= 0) & (d2 >= 0) & (d6 <= 0)
+        if m.any():
+            den = d2[m] - d6[m]
+            t_  = np.clip(np.where(den > 1e-12, d2[m] / den, 0.0), 0.0, 1.0)
+            u[m] = 1.0 - t_;  v[m] = 0.0;  w[m] = t_
+
+        # Edge BC: va <= 0, d4-d3 >= 0, d5-d6 >= 0
+        m = (va <= 0) & ((d4 - d3) >= 0) & ((d5 - d6) >= 0)
+        if m.any():
+            num = d4[m] - d3[m]
+            den = num + (d5[m] - d6[m])
+            t_  = np.clip(np.where(den > 1e-12, num / den, 0.0), 0.0, 1.0)
+            u[m] = 0.0;  v[m] = 1.0 - t_;  w[m] = t_
+
+        # ── vertex regions (highest priority – applied last) ──────────────
+        m = (d1 <= 0) & (d2 <= 0)          # vertex A
+        u[m] = 1.0;  v[m] = 0.0;  w[m] = 0.0
+        m = (d3 >= 0) & (d4 <= d3)         # vertex B
+        u[m] = 0.0;  v[m] = 1.0;  w[m] = 0.0
+        m = (d6 >= 0) & (d5 <= d6)         # vertex C
+        u[m] = 0.0;  v[m] = 0.0;  w[m] = 1.0
+
+        q     = u[:, None] * A + v[:, None] * B + w[:, None] * C  # (T, 3)
+        dist2 = np.sum((P - q) ** 2, axis=1)                       # (T,)
+        best_t = int(np.argmin(dist2))
+
+        best_tri[k]  = best_t
+        best_uvw[k]  = [float(u[best_t]), float(v[best_t]), float(w[best_t])]
+        best_dist[k] = float(np.sqrt(max(0.0, dist2[best_t])))
+
+    return best_tri, best_uvw, best_dist.astype(np.float32)
 
 
 # ---------------------------------------------------------------------------

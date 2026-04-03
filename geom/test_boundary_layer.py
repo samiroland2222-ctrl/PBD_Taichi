@@ -16,7 +16,7 @@ Tests verify:
 
 import numpy as np
 import pytest
-from PBD_Taichi.geom.distance_field import Mesh, build_boundary_layer
+from PBD_Taichi.geom.distance_field import BasicTriMesh, build_boundary_layer
 
 
 # ─────────────────────────────────────────────────────────────
@@ -28,7 +28,7 @@ def make_star_prism(
     outer_r: float = 1.0,
     inner_r: float = 0.4,
     height: float = 0.5,
-) -> Mesh:
+) -> BasicTriMesh:
     """Return a closed triangulated star-prism surface.
 
     The star cross-section has `n_points` outer tips (at `outer_r`) and
@@ -65,7 +65,7 @@ def make_star_prism(
         faces.append([i,    j,    n+j ])
         faces.append([i,    n+j,  n+i ])
 
-    return Mesh(
+    return BasicTriMesh(
         verts=np.asarray(verts, dtype=np.float64),
         faces=np.asarray(faces,  dtype=np.int32),
     )

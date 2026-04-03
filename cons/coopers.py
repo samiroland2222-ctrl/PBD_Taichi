@@ -17,6 +17,7 @@ import taichi as ti
 import numpy as np
 
 from PBD_Taichi.cons.breast import Breast
+from PBD_Taichi.cons.torso import BreastRegion
 
 
 @ti.data_oriented
@@ -174,7 +175,7 @@ class CoopersLigaments:
 # ---------------------------------------------------------------------------
 
 def build_coopers(skeleton,
-                  breast: Breast,
+                  breast: BreastRegion,
                   dt: float,
                   alpha: float = 1e-4,
                   pull_only: bool = True,
