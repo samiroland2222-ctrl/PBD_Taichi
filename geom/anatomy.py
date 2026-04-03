@@ -550,6 +550,57 @@ class Skeleton:
         self.upper_arm_l_v.from_numpy(self._upper_arm_l_world.astype(np.float32))
         self.upper_arm_r_v.from_numpy(self._upper_arm_r_world.astype(np.float32))
 
+        # ── ribcage (rigid, parented to chest root) ────────────────────────
+        if hasattr(self, '_ribcage_v_local'):
+            self._ribcage_world = (self._ribcage_v_local + self.chest_pos).astype(np.float32)
+            if self._ribcage_v_p_ext is not None:
+                self._ribcage_v_p_ext.from_numpy(self._ribcage_world)
+
+    # ------------------------------------------------------------------
+    def set_ribcage_mesh(self, verts_world_np: np.ndarray,
+                         v_p_field=None,
+                         faces_np: np.ndarray | None = None):
+        """Register the ribcage mesh so it tracks ``chest_pos`` each frame.
+
+        Parameters
+        ----------
+        verts_world_np : (N, 3) ndarray
+            Ribcage vertex positions in **world space** at the time of
+            registration (current ``chest_pos`` is assumed).
+        v_p_field : ti.MatrixField or None
+            If provided, ``update()`` will push the recomputed world
+            positions into this field each frame so the mesh renders
+            correctly without the caller doing anything extra.
+        faces_np : (M, 3) int32 ndarray or None
+            Surface triangle face array (indices into ``verts_world_np``).
+            Required for inward-raycast skin-shell generation.
+        """
+        self._ribcage_v_local  = (verts_world_np - self.chest_pos).astype(np.float32)
+        self._ribcage_world    = verts_world_np.copy().astype(np.float32)
+        self._ribcage_v_p_ext  = v_p_field   # may be None
+        self._ribcage_f_np     = (np.asarray(faces_np, dtype=np.int32).reshape(-1, 3)
+                                  if faces_np is not None
+                                  else np.zeros((0, 3), dtype=np.int32))
+
+    def get_ribcage_faces_np(self) -> np.ndarray:
+        """Triangle face array (M, 3) for the ribcage mesh.
+
+        Returns an empty ``(0, 3)`` array if no ribcage has been registered
+        or if the ribcage was registered without a face array.
+        """
+        if not hasattr(self, '_ribcage_f_np'):
+            return np.zeros((0, 3), dtype=np.int32)
+        return self._ribcage_f_np.copy()
+
+    def get_ribcage_verts_world_np(self) -> np.ndarray:
+        """Current world-space ribcage vertex positions.
+
+        Returns an empty ``(0, 3)`` array if no ribcage has been registered.
+        """
+        if not hasattr(self, '_ribcage_world'):
+            return np.zeros((0, 3), dtype=np.float32)
+        return self._ribcage_world.copy()
+
     # ------------------------------------------------------------------
     def _update_fascia(self, v_local, top_idx, bot_idx, R, offset):
         """
@@ -600,21 +651,40 @@ class Skeleton:
         """World-space positions of ALL right fascia vertices (used as ligament anchors)."""
         return self._fascia_r_world.copy()   # (n_fascia, 3)
 
-    def get_clavicle_left_world_np(self):
+    def get_clavicle_left_world_np(self) -> np.ndarray:
         """World-space positions of ALL left clavicle vertices."""
         return self._clavicle_l_world.copy()
 
-    def get_clavicle_right_world_np(self):
+    def get_clavicle_left_faces_np(self) -> np.ndarray:
+        """Triangle face array (M, 3) for the left clavicle mesh."""
+        return self._clavicle_l_f_np
+
+    def get_clavicle_right_faces_np(self) -> np.ndarray:
+        """Triangle face array (M, 3) for the right clavicle mesh.
+        Indices reference the same vertex ordering as
+        ``get_clavicle_right_world_np()`` (x-mirrored world positions)."""
+        return self._clavicle_r_f_np
+
+    def get_clavicle_right_world_np(self) -> np.ndarray:
         """World-space positions of ALL right clavicle vertices."""
         return self._clavicle_r_world.copy()
 
-    def get_upper_arm_left_surface_np(self):
+    def get_upper_arm_left_surface_np(self) -> np.ndarray:
         """World-space positions of ALL left upper-arm vertices."""
         return self._upper_arm_l_world.copy()
 
-    def get_upper_arm_right_surface_np(self):
+    def get_upper_arm_right_surface_np(self) -> np.ndarray:
         """World-space positions of ALL right upper-arm vertices."""
         return self._upper_arm_r_world.copy()
+
+    def get_upper_arm_left_faces_np(self) -> np.ndarray:
+        """Triangle face array (M, 3) for the left upper-arm mesh."""
+        return self._upper_arm_l_f_np
+
+    def get_upper_arm_right_faces_np(self) -> np.ndarray:
+        """Triangle face array (M, 3) for the right upper-arm mesh.
+        Indices address the vertex ordering of get_upper_arm_right_surface_np()."""
+        return self._upper_arm_r_f_np
 
     # ------------------------------------------------------------------
     def reset_pose(self):

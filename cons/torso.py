@@ -8,13 +8,16 @@ import taichi as ti
 try:
     from PBD_Taichi.cons import framework, deform3d, coopers, skin_anchor
     from PBD_Taichi.cons.breast import Breast
+    from PBD_Taichi.cons.skin_anchor import BaryBreastSkinConstraint, KinematicSkinSpringConstraint
     from PBD_Taichi.geom import gtet, skin as skin_mod
     from PBD_Taichi.geom.skin import AnchorType
 except ImportError:
     from cons import framework, deform3d, coopers, skin_anchor
     from cons.breast import Breast
+    from cons.skin_anchor import BaryBreastSkinConstraint, KinematicSkinSpringConstraint
     from geom import gtet, skin as skin_mod
     from geom.skin import AnchorType
+
 # ---------------------------------------------------------------------------
 # Lightweight adapter so build_coopers can work on a region of the unified mesh
 # ---------------------------------------------------------------------------
@@ -29,21 +32,27 @@ class BreastRegion:
     @property
     def verts_np(self):
         return self.mesh.v_p_ref.to_numpy()
+
 # ---------------------------------------------------------------------------
 # UnifiedTorso
 # ---------------------------------------------------------------------------
 class UnifiedTorso:
     """
     Unified deformable body: left breast + right breast + skin shell.
-    Construction
-    ------------
-    1. Generate left/right breast mesh data (numpy).
-    2. Generate skin shell (numpy) using the breast surface + skeleton data.
-    3. Merge all three into one TetMesh.
-    4. Pin breast bases + rigid skin anchors.
-    5. Build PBD framework, Deform3D, Cooper's ligaments, skin-anchor springs.
-    The caller drives the simulation via ``substep()``.
+
+    Anchor types:
+      RIBCAGE          – pinned (invm=0), kinematic position written each frame
+      CLAVICLE_L/R     – KinematicSkinSpringConstraint, barycentric on clavicle mesh
+      ARM_L/R          – KinematicSkinSpringConstraint, barycentric on arm mesh
+      BREAST_L/R       – BaryBreastSkinConstraint, barycentric on breast tet surface
+      FREE             – no constraint
     """
+    # Types that stay kinematically pinned (invm=0)
+    _PINNED_TYPES = frozenset({AnchorType.RIBCAGE})
+    # Types that become elastic springs toward the skeleton surface
+    _SPRING_TYPES = frozenset({AnchorType.CLAVICLE_L, AnchorType.CLAVICLE_R,
+                               AnchorType.ARM_L, AnchorType.ARM_R})
+
     def __init__(
         self,
         skeleton,
@@ -56,11 +65,13 @@ class UnifiedTorso:
         breast_target_tets=300,
         rng=None,
         ribcage_verts_np=None,
+        ribcage_faces_np=None,
         skin_n_u=20,
         skin_n_v=30,
         skin_thickness=0.005,
-        skin_query_radius=0.025,
-        skin_max_anchor_dist=0.04,
+        skin_egg_depth=0.15,
+        skin_gap=0.001,
+        arm_init_abduction=0.4,   # radians – A-pose for skin shell init
         g=(0.0, -9.8, 0.0),
         dt=None,
         fps=60,
@@ -70,10 +81,12 @@ class UnifiedTorso:
         rng = rng or _random.Random(42)
         def _rand(center, spread_pct):
             return center + spread_pct * center * (rng.random() * 2 - 1)
+
         self.skeleton = skeleton
         if dt is None:
             dt = 1.0 / (fps * substep)
         self.dt = dt
+
         # ── 1. breast numpy data ──────────────────────────────────────────
         v_l, t_l, f_l, base_l, top_l = Breast.make_numpy(
             spread=_rand(breast_spread, 0.1),
@@ -95,83 +108,93 @@ class UnifiedTorso:
         self.n_right_verts = len(v_r)
         self.n_left_tets   = len(t_l) // 4
         self.n_right_tets  = len(t_r) // 4
+
         # ── 2. skin shell ─────────────────────────────────────────────────
-        breast_l_outer = v_l[top_l]
+        # Set arms to A-pose so the skin grid overlaps the arm capsule and
+        # can be properly anchored/initialised against it.
+        # The skeleton is left in this pose; the simulation starts here and
+        # gravity + joint sliders drive it from A-pose onward.
+        skeleton.arm_left_abduction  = arm_init_abduction
+        skeleton.arm_right_abduction = arm_init_abduction
+        skeleton.update()
+
+        breast_l_outer = v_l[top_l]  # kept for compatibility (not used in skin shell)
         breast_r_outer = v_r[top_r]
         shell = skin_mod.generate_skin_shell(
             skeleton,
-            breast_l_outer_verts=breast_l_outer,
-            breast_r_outer_verts=breast_r_outer,
+            breast_l_verts=v_l,
+            breast_l_faces=f_l.reshape(-1, 3),
+            breast_r_verts=v_r,
+            breast_r_faces=f_r.reshape(-1, 3),
             ribcage_verts=ribcage_verts_np,
+            ribcage_faces=(ribcage_faces_np
+                           if ribcage_faces_np is not None
+                           else skeleton.get_ribcage_faces_np()),
             n_u=skin_n_u, n_v=skin_n_v,
             thickness=skin_thickness,
-            query_radius=skin_query_radius,
-            max_anchor_dist=skin_max_anchor_dist,
+            egg_depth=skin_egg_depth,
+            gap=skin_gap,
         )
         self.shell = shell
         self.n_skin_verts = len(shell.verts)
-        self.n_skin_tets  = len(shell.tets_flat) // 4
-        # ── 3. merge into one TetMesh ─────────────────────────────────────
+        self.n_skin_tets  = 0   # no tets yet – single-surface mode
+
+        # ── 3. merge breast meshes only (skin is visual-only for now) ─────
         merged_v, merged_t, merged_f = gtet.merge_numpy(
             (v_l, t_l, f_l),
             (v_r, t_r, f_r),
-            (shell.verts, shell.tets_flat, shell.faces_flat),
         )
         self.mesh = gtet.TetMesh(v=merged_v, t=merged_t, f=merged_f,
                                  rho=1.0, scale=1.0)
+
+        # ── 3b. skin trimesh – Taichi fields for rendering only ───────────
+        n_sv = len(shell.verts)
+        self.skin_v = ti.Vector.field(3, dtype=ti.f32, shape=max(1, n_sv))
+        if n_sv > 0:
+            self.skin_v.from_numpy(shell.verts.astype(np.float32))
+        n_sf = len(shell.faces_flat)
+        self.skin_f = ti.field(dtype=ti.i32, shape=max(1, n_sf))
+        if n_sf > 0:
+            self.skin_f.from_numpy(shell.faces_flat.astype(np.int32))
+
         # ── index offsets ─────────────────────────────────────────────────
         self.left_offset  = 0
         self.right_offset = self.n_left_verts
-        self.skin_offset  = self.n_left_verts + self.n_right_verts
+
         # breast vertex indices in the unified mesh
         self.base_l = base_l + self.left_offset
         self.top_l  = top_l  + self.left_offset
         self.base_r = base_r + self.right_offset
         self.top_r  = top_r  + self.right_offset
-        # ── 4. pin breast bases ───────────────────────────────────────────
+
+        # ── 4. pin breast bases only (skin not yet in simulation) ─────────
         pin_idx = list(self.base_l) + list(self.base_r)
-        # pin rigid skin anchors (everything except BREAST and FREE)
-        rigid_types = {AnchorType.CLAVICLE_L, AnchorType.CLAVICLE_R,
-                       AnchorType.ARM_L, AnchorType.ARM_R, AnchorType.RIBCAGE}
-        self._rigid_skin_local = []          # (local inner idx, atype, target idx)
-        self._rigid_skin_global = []         # global vert idx in unified mesh
-        for k in range(len(shell.anchor_type)):
-            atype = shell.anchor_type[k]
-            if atype in rigid_types:
-                global_idx = k + self.skin_offset   # inner verts are first in shell
-                self._rigid_skin_global.append(global_idx)
-                self._rigid_skin_local.append((k, atype, shell.anchor_target[k]))
-                pin_idx.append(global_idx)
+
         pin_np = np.array(pin_idx, dtype=np.int32)
         pin_ti = ti.field(dtype=ti.i32, shape=len(pin_np))
         pin_ti.from_numpy(pin_np)
         self.mesh.set_fixed_point(len(pin_np), pin_ti)
         self._pin_np = pin_np
         self._pin_ti = pin_ti
-        # ── precompute rigid target scatter arrays ────────────────────────
-        self._build_rigid_target_maps()
-        # ── 5. set initial kinematic positions for rigid skin verts ──────
-        self._write_rigid_skin_positions()
-        # Recompute mass from final vertex positions so tet volumes are
-        # consistent (some hex cells collapse when adjacent verts snap to the
-        # same skeleton attachment point).
-        self.mesh.reset_mass(rho=1.0)
-        self.mesh.set_fixed_point(len(pin_np), pin_ti)
+
         self.breast_l = BreastRegion(self.mesh, self.base_l, self.top_l)
         self.breast_r = BreastRegion(self.mesh, self.base_r, self.top_r)
-        # ── 7. build PBD framework ────────────────────────────────────────
+
+        # ── 5. build PBD framework ────────────────────────────────────────
         g_vec = ti.Vector(list(g))
         self.xpbd = framework.pbd_framework(
             g=g_vec, n_vert=self.mesh.n_vert, v_p=self.mesh.v_p,
             dt=dt, damp=0.99, invm=self.mesh.v_invm)
-        # Deform3D for all tets (single stiffness set for now)
+
+        # Deform3D for all tets
         self.deform = deform3d.Deform3D(
             n=self.mesh.n_tet, indices=self.mesh.t_i,
             invm=self.mesh.v_invm, pos=self.mesh.v_p,
             pos_ref=self.mesh.v_p_ref, tet_mass=self.mesh.t_mass,
             dt=dt, hydro_alpha=1e-2, devia_alpha=1e1)
         self.xpbd.add_cons(self.deform)
-        # ── 8. Cooper's ligaments ─────────────────────────────────────────
+
+        # ── 6. Cooper's ligaments ─────────────────────────────────────────
         self.ligaments_l, _ = coopers.build_coopers(
             skeleton=skeleton, breast=self.breast_l, dt=dt,
             alpha=1e3, pull_only=True, max_attach_dist=0.5,
@@ -182,122 +205,68 @@ class UnifiedTorso:
             alpha=1e3, pull_only=True, max_attach_dist=0.5,
             n_ligaments=90, pretension=1.0, side='right')
         self.xpbd.add_cons(self.ligaments_r)
-        # ── 9. skin anchor springs (bilateral: breast-coupled) ────────────
-        bilateral_skin_idx, bilateral_breast_idx = self._build_bilateral_pairs()
-        self.skin_anchors = skin_anchor.SkinAnchorConstraint(
+
+        # ── 7. skin constraints (empty – skin not yet in simulation) ──────
+        _empty_i = np.zeros(0, dtype=np.int32)
+        _empty_f3 = np.zeros((0, 3), dtype=np.float32)
+        self.skin_anchors = BaryBreastSkinConstraint(
             v_p=self.mesh.v_p, v_invm=self.mesh.v_invm,
-            skin_idx_np=bilateral_skin_idx,
-            breast_idx_np=bilateral_breast_idx,
+            skin_idx_np=_empty_i,
+            tri_v0_np=_empty_i, tri_v1_np=_empty_i, tri_v2_np=_empty_i,
+            bary_uvw_np=_empty_f3,
             dt=dt, alpha=1e-2, pretension=1.0)
         self.xpbd.add_cons(self.skin_anchors)
-        # ── 10. bounding box collision ────────────────────────────────────
-        # (caller may add one later via self.xpbd.add_collision)
-        # ── 11. init rest status ──────────────────────────────────────────
+
+        self.skeleton_skin_springs = KinematicSkinSpringConstraint(
+            v_p=self.mesh.v_p, v_invm=self.mesh.v_invm,
+            skin_idx_np=_empty_i, init_target_np=_empty_f3,
+            dt=dt, alpha=1e-3, pretension=1.0)
+        self.xpbd.add_cons(self.skeleton_skin_springs)
+
+        # ── 8. init rest status ───────────────────────────────────────────
         self.xpbd.init_rest_status()
-        print(f"[UnifiedTorso] unified mesh: {self.mesh.n_vert} verts, "
-              f"{self.mesh.n_tet} tets  "
-              f"(breast L={self.n_left_tets}, R={self.n_right_tets}, "
-              f"skin={self.n_skin_tets})")
+        print(f"[UnifiedTorso] {self.mesh.n_vert} verts, {self.mesh.n_tet} tets  "
+              f"(L={self.n_left_tets} R={self.n_right_tets})  "
+              f"skin surface: {self.n_skin_verts} verts (visual only)")
+
     # ------------------------------------------------------------------
-    # Rigid-skin kinematic helpers
+    # Skin kinematic update – no-op until skin is brought into simulation
     # ------------------------------------------------------------------
-    def _build_rigid_target_maps(self):
-        """Precompute per-structure scatter arrays for fast target update."""
-        self._rigid_global_np = np.array(self._rigid_skin_global, dtype=np.int32)
-        n = len(self._rigid_skin_local)
-        if n == 0:
-            self._rigid_targets_np = np.zeros((0, 3), dtype=np.float32)
-            return
-        self._rigid_targets_np = np.zeros((n, 3), dtype=np.float32)
-        # build per-type masks and target-index arrays
-        self._rigid_type  = np.array([x[1] for x in self._rigid_skin_local], dtype=np.int32)
-        self._rigid_tidx  = np.array([x[2] for x in self._rigid_skin_local], dtype=np.int32)
-    def _write_rigid_skin_positions(self):
-        """Write kinematic target positions into v_p for pinned skin verts."""
-        if len(self._rigid_skin_local) == 0:
-            return
-        positions = self._gather_rigid_positions()
-        # write into mesh v_p and v_p_ref (rest + current)
-        all_v = self.mesh.v_p.to_numpy()
-        all_r = self.mesh.v_p_ref.to_numpy()
-        for k, gidx in enumerate(self._rigid_skin_global):
-            all_v[gidx] = positions[k]
-            all_r[gidx] = positions[k]
-        self.mesh.v_p.from_numpy(all_v.astype(np.float32))
-        self.mesh.v_p_ref.from_numpy(all_r.astype(np.float32))
-    def _gather_rigid_positions(self) -> np.ndarray:
-        """Gather world positions for all rigid skin anchors from skeleton."""
-        skel = self.skeleton
-        clav_l = skel.get_clavicle_left_world_np()
-        clav_r = skel.get_clavicle_right_world_np()
-        arm_l  = skel.get_upper_arm_left_surface_np()
-        arm_r  = skel.get_upper_arm_right_surface_np()
-        src = {
-            int(AnchorType.CLAVICLE_L): clav_l,
-            int(AnchorType.CLAVICLE_R): clav_r,
-            int(AnchorType.ARM_L):      arm_l,
-            int(AnchorType.ARM_R):      arm_r,
-        }
-        n = len(self._rigid_skin_local)
-        out = np.empty((n, 3), dtype=np.float32)
-        for k in range(n):
-            _, atype, tidx = self._rigid_skin_local[k]
-            arr = src.get(int(atype))
-            if arr is not None and tidx < len(arr):
-                out[k] = arr[tidx]
-            else:
-                out[k] = self.mesh.v_p_ref.to_numpy()[self._rigid_skin_global[k]]
-        return out
     def update_kinematic_skin(self):
-        """Call once per frame (after skeleton.update()) to move pinned skin verts."""
-        if len(self._rigid_skin_local) == 0:
-            return
-        positions = self._gather_rigid_positions()
-        all_v = self.mesh.v_p.to_numpy()
-        for k, gidx in enumerate(self._rigid_skin_global):
-            all_v[gidx] = positions[k]
-        self.mesh.v_p.from_numpy(all_v.astype(np.float32))
-    # ------------------------------------------------------------------
-    # Bilateral breast-skin pair construction
-    # ------------------------------------------------------------------
-    def _build_bilateral_pairs(self):
-        """Return (skin_global_idx, breast_global_idx) arrays for bilateral springs."""
-        shell = self.shell
-        skin_idx_list   = []
-        breast_idx_list = []
-        # reference positions of the unified mesh (before Taichi allocation alters them)
-        all_ref = self.mesh.v_p_ref.to_numpy()
-        for k in range(len(shell.anchor_type)):
-            atype = shell.anchor_type[k]
-            if atype == AnchorType.BREAST_L:
-                skin_global = k + self.skin_offset
-                # anchor_target is index into breast_l_outer_verts which were
-                # indexed by top_l into the left breast vertex array
-                breast_global = int(self.top_l[shell.anchor_target[k]])
-                skin_idx_list.append(skin_global)
-                breast_idx_list.append(breast_global)
-            elif atype == AnchorType.BREAST_R:
-                skin_global = k + self.skin_offset
-                breast_global = int(self.top_r[shell.anchor_target[k]])
-                skin_idx_list.append(skin_global)
-                breast_idx_list.append(breast_global)
-        print(f"[UnifiedTorso] {len(skin_idx_list)} bilateral skin-breast springs")
-        return (np.array(skin_idx_list,   dtype=np.int32),
-                np.array(breast_idx_list, dtype=np.int32))
+        pass
+
     # ------------------------------------------------------------------
     # Rendering
     # ------------------------------------------------------------------
-    def get_render_draws(self, breast_color=(0.85, 0.65, 0.55),
-                         skin_color=(0.90, 0.78, 0.70)):
-        """Return a list of scene-draw callables for the unified mesh."""
+    def get_render_draws(self, breast_color=(0.85, 0.65, 0.55)):
         mesh = self.mesh
         def draw_all(scene):
             scene.mesh(mesh.v_p, mesh.f_i, color=breast_color,
                        show_wireframe=False, two_sided=True)
         return [draw_all]
+
+    def get_skin_draws(self, color=(0.90, 0.78, 0.68)):
+        """Render the raycast skin surface (visual only)."""
+        sv, sf = self.skin_v, self.skin_f
+        def draw_skin(scene):
+            scene.mesh(sv, sf, color=color, two_sided=True)
+        return [draw_skin]
+
     def get_ligament_draws(self):
         return [self.ligaments_l.get_render_draw(),
                 self.ligaments_r.get_render_draw()]
+
+    def get_skin_anchor_draws(self):
+        """Spring visualisations – empty until skin enters simulation."""
+        draws = []
+        if self.skin_anchors.n > 0:
+            draws.append(self.skin_anchors.get_render_draw(
+                color=(0.85, 0.25, 0.15), width=1.5))
+        if self.skeleton_skin_springs.n > 0:
+            draws.append(self.skeleton_skin_springs.get_render_draw(
+                color=(0.25, 0.60, 0.95), width=1.5))
+        return draws
+
     # ------------------------------------------------------------------
     # Reset
     # ------------------------------------------------------------------
@@ -306,5 +275,4 @@ class UnifiedTorso:
         self.mesh.reset_mass(rho=1.0)
         self.mesh.set_fixed_point(len(self._pin_np), self._pin_ti)
         self.xpbd.v_v.fill(0)
-        self._write_rigid_skin_positions()
         self.xpbd.init_rest_status()

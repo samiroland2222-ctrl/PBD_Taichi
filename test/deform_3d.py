@@ -38,6 +38,13 @@ ribcage_mesh = _load_mesh(
 # ── Skeleton (clavicles + upper arms) ─────────────────────────────────────────
 skel = anatomy.Skeleton()
 
+# Register the ribcage with the skeleton so it tracks chest_pos each frame.
+# Skeleton stores local coords (world − chest_pos) and writes world positions
+# back into ribcage_mesh.v_p on every skel.update() call.
+skel.set_ribcage_mesh(ribcage_mesh.v_p.to_numpy(),
+                      v_p_field=ribcage_mesh.v_p,
+                      faces_np=ribcage_mesh.faces_np)
+
 # ── Simulation parameters ─────────────────────────────────────────────────────
 g          = (0.0, -9.8, 0.0)
 fps        = 60
@@ -56,9 +63,12 @@ torso = UnifiedTorso(
     breast_tilt=0.2,
     breast_target_tets=300,
     ribcage_verts_np=ribcage_verts,
+    ribcage_faces_np=ribcage_mesh.faces_np,
     skin_n_u=20,
     skin_n_v=30,
     skin_thickness=0.005,
+    skin_egg_depth=0.15,
+    skin_gap=0.001,
     g=g,
     dt=dt,
     fps=fps,
@@ -85,9 +95,13 @@ tirender.add_scene_render_draw(skeleton_mesh.get_render_draw(color=(0.7, 0.7, 0.
 tirender.add_scene_render_draw(ribcage_mesh.get_render_draw(color=(0.7, 0.7, 0.5), wireframe=False))
 for draw in torso.get_render_draws():
     tirender.add_scene_render_draw(draw)
+for draw in torso.get_skin_draws(color=(0.1, 1.0, 0.1)):          # raycast skin surface
+    tirender.add_scene_render_draw(draw)
 for draw in skel.get_render_draws():
     tirender.add_scene_render_draw(draw)
 for draw in torso.get_ligament_draws():
+    tirender.add_scene_render_draw(draw)
+for draw in torso.get_skin_anchor_draws():   # reddish bilateral breast-skin springs
     tirender.add_scene_render_draw(draw)
 
 # ── GUI ───────────────────────────────────────────────────────────────────────
@@ -95,6 +109,7 @@ log_hydro     = [math.log10(torso.deform.hydro_alpha)]
 log_devia     = [math.log10(torso.deform.devia_alpha)]
 log_lig_alpha = [math.log10(torso.ligaments_l.alpha)]
 log_skin_alpha = [math.log10(torso.skin_anchors.alpha)] if torso.skin_anchors.n > 0 else [0.0]
+log_skel_alpha = [math.log10(torso.skeleton_skin_springs.alpha)] if torso.skeleton_skin_springs.n > 0 else [0.0]
 
 def gui_draw(gui):
     gui.text("── Tissue stiffness ──")
@@ -111,10 +126,16 @@ def gui_draw(gui):
     gui.text(f"  alpha={torso.ligaments_l.alpha:.2e}")
 
     if torso.skin_anchors.n > 0:
-        gui.text("── Skin anchors ──")
-        log_skin_alpha[0] = gui.slider_float("log10(skin)", log_skin_alpha[0], -4.0, 3.0)
+        gui.text("── Breast-skin springs ──")
+        log_skin_alpha[0] = gui.slider_float("log10(breast-skin)", log_skin_alpha[0], -4.0, 3.0)
         torso.skin_anchors.alpha = 10 ** log_skin_alpha[0]
         gui.text(f"  alpha={torso.skin_anchors.alpha:.2e}  n={torso.skin_anchors.n}")
+
+    if torso.skeleton_skin_springs.n > 0:
+        gui.text("── Skeleton springs (clav+arm) ──")
+        log_skel_alpha[0] = gui.slider_float("log10(skel)", log_skel_alpha[0], -4.0, 3.0)
+        torso.skeleton_skin_springs.alpha = 10 ** log_skel_alpha[0]
+        gui.text(f"  alpha={torso.skeleton_skin_springs.alpha:.2e}  n={torso.skeleton_skin_springs.n}")
 
     gui.text("── Clavicle joints ──")
     skel.clavicle_left_pitch  = gui.slider_float("L pitch", skel.clavicle_left_pitch, -0.5, 0.6)
