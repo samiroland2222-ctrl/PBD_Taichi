@@ -30,9 +30,9 @@ skeleton_mesh = _load_mesh(
 )
 
 ribcage_mesh = _load_mesh(
-    filepath=os.path.join(os.getcwd(), 'assets', 'mesh', 'ribcage_and_pelvis.obj'),
+    filepath=os.path.join(os.getcwd(), 'assets', 'mesh', 'ribcage.obj'),
     scale=1/50,
-    repose=(-0.003, -0.14, -0.1)
+    repose=(-0.006, 0.04, -0.08)
 )
 
 # ── Skeleton (clavicles + upper arms) ─────────────────────────────────────────

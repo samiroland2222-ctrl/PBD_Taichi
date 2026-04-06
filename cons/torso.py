@@ -53,7 +53,7 @@ class UnifiedTorso:
         rng=None,
         ribcage_verts_np=None,
         ribcage_faces_np=None,
-        skin_target_n_tets=1000,
+        skin_target_n_tets=2000,
         skin_thickness=0.01,
         arm_init_abduction=0.4,   # radians – A-pose for skin shell init
         g=(0.0, -9.8, 0.0),
@@ -116,6 +116,8 @@ class UnifiedTorso:
         self.skin_shell: BasicTetMesh = skin_shell
         self.barycentric_bindings: list[BarycentricBindingDefinition] = barycentric_bindings
 
+        self.skin_shell = None
+
         # ── 3. merge breast meshes only (skin is visual-only for now) ─────
         merged_v, merged_t, merged_f = gtet.merge_numpy(
             (v_l, t_l, f_l),
@@ -125,16 +127,20 @@ class UnifiedTorso:
                                  rho=1.0, scale=1.0)
 
         # ── 3b. skin trimesh – Taichi fields for rendering only ───────────
-        skin_surf_f = self.skin_shell.surface_faces()          # (F, 3) int32
-        skin_surf_v = self.skin_shell.verts.astype(np.float32) # (N, 3) float32
-        n_sv = len(skin_surf_v)
-        n_sf = skin_surf_f.size                                # flat element count
-        self.skin_v = ti.Vector.field(3, dtype=ti.f32, shape=max(1, n_sv))
-        self.skin_f = ti.field(dtype=ti.i32, shape=max(1, n_sf))
-        if n_sv > 0:
-            self.skin_v.from_numpy(skin_surf_v)
-        if n_sf > 0:
-            self.skin_f.from_numpy(skin_surf_f.flatten())
+        if self.skin_shell:
+            skin_surf_f = self.skin_shell.surface_faces()          # (F, 3) int32
+            skin_surf_v = self.skin_shell.verts.astype(np.float32) # (N, 3) float32
+            n_sv = len(skin_surf_v)
+            n_sf = skin_surf_f.size                                # flat element count
+            self.skin_v = ti.Vector.field(3, dtype=ti.f32, shape=max(1, n_sv))
+            self.skin_f = ti.field(dtype=ti.i32, shape=max(1, n_sf))
+            if n_sv > 0:
+                self.skin_v.from_numpy(skin_surf_v)
+            if n_sf > 0:
+                self.skin_f.from_numpy(skin_surf_f.flatten())
+        else:
+            self.skin_v = None
+            self.skin_f = None
 
 
         # ── index offsets ─────────────────────────────────────────────────
@@ -221,14 +227,16 @@ class UnifiedTorso:
         mesh = self.mesh
         def draw_all(scene):
             scene.mesh(mesh.v_p, mesh.f_i, color=breast_color,
-                       show_wireframe=False, two_sided=True)
+                       show_wireframe=False, two_sided=False)
         return [draw_all]
 
     def get_skin_draws(self, color=(0.90, 0.78, 0.68)):
         """Render the raycast skin surface (visual only)."""
+        if not self.skin_shell:
+            return []
         sv, sf = self.skin_v, self.skin_f
         def draw_skin(scene):
-            scene.mesh(sv, sf, color=color, two_sided=True, show_wireframe=True)
+            scene.mesh(sv, sf, color=color, two_sided=False, show_wireframe=True)
         return [draw_skin]
 
     def get_ligament_draws(self):

@@ -1,11 +1,14 @@
+from collections import Counter
+
 import gmsh
 import numpy as np
-
+from meshlib import mrmeshnumpy, mrmeshpy
 
 class BasicTriMesh:
-    def __init__(self, verts: np.ndarray, faces: np.ndarray):
+    def __init__(self, verts: np.ndarray, faces: np.ndarray, label: str = None):
         self.verts = verts # [N_v, 3]
         self.faces = faces # [N_f, 3]
+        self.label = label
 
     def deduplicated(self, tol: float = 1e-8) -> 'BasicTriMesh':
         """Return a new BasicTriMesh with duplicate vertices removed and faces remapped.
@@ -24,11 +27,22 @@ class BasicTriMesh:
         mirrored_faces = self.faces.copy()
         # bilateral mirror around Y-Z plane
         mirrored_verts[:, 0] *= -1
-        # swap face winding to maintain outward normals after mirroring
-        mirrored_faces[:, 0] = self.faces[:, 1]
-        mirrored_faces[:, 1] = self.faces[:, 0]
-        return BasicTriMesh(mirrored_verts, mirrored_faces)
+        return BasicTriMesh(mirrored_verts, mirrored_faces).swapped_winding_order()
 
+    def swapped_winding_order(self) -> 'BasicTriMesh':
+        swapped_faces = self.faces.copy()
+        # swap the first two vertices of each face to flip winding order
+        swapped_faces[:, 0] = self.faces[:, 1]
+        swapped_faces[:, 1] = self.faces[:, 0]
+        return BasicTriMesh(self.verts, swapped_faces)
+
+    def save(self, path: str):
+        import meshio
+        meshio.write_points_cells(
+            path,
+            self.verts,
+            [("triangle", self.faces)],
+        )
 
 
 def extract_surface_triangles(verts: np.ndarray, tets: np.ndarray) -> np.ndarray:
@@ -135,11 +149,13 @@ def _remesh_surface(mesh: BasicTriMesh, target_edge_len: float) -> BasicTriMesh:
     """
     import pymeshlab
 
-    def _do_remesh(verts: np.ndarray, faces: np.ndarray, e: float):
+    def _do_remesh(verts: np.ndarray, faces: np.ndarray, e_pct: float):
         ms = pymeshlab.MeshSet()
         ms.add_mesh(pymeshlab.Mesh(vertex_matrix=verts, face_matrix=faces))
         ms.meshing_isotropic_explicit_remeshing(
-            targetlen=pymeshlab.PureValue(float(e)),
+            #featuredeg=90,
+            adaptive=True,
+            targetlen=pymeshlab.PureValue(float(e_pct)),
             iterations=20,
         )
         m = ms.current_mesh()
@@ -234,59 +250,194 @@ def _extrude_to_tets(mesh: BasicTriMesh, heights: list[float], debug_save_path: 
 
 # ── public API ─────────────────────────────────────────────────────────────────
 
+def _is_watertight(m: BasicTriMesh, repair=True):
+    """
+    Check whether m is a watertight triangle mesh.
+    """
+    edge_count = Counter()
+    unused_vertices = set(range(len(m.verts)))
+    for face in m.faces:
+        edges = [(face[i], face[(i + 1) % 3]) for i in range(3)]
+        for a, b in edges:
+            key = tuple(sorted((a, b)))
+            edge_count[key] += 1
+        for vi in face:
+            unused_vertices.discard(vi)
+
+    broken = []
+    for edge, count in edge_count.items():
+        if count != 2:
+            print(f"edge {edge} has count {count}")
+            broken.append(edge)
+
+    if broken:
+        return False
+
+    #if unused_vertices:
+    #    return False
+
+    return True
+
+
 def boolean_merge_meshes(meshes: list[BasicTriMesh], debug_save_path=None) -> BasicTriMesh:
+    """Union all meshes into a single watertight surface mesh using manifold3d.
 
-    gmsh.initialize()
-    gmsh.model.add("boolean_merge")
+    Parameters
+    ----------
+    meshes : list[BasicTriMesh]
+        Input surface meshes to union together.
+    debug_save_path : str, optional
+        If provided, save the resulting mesh to this path via meshio.
 
-    surf_tags = []
+    Returns
+    -------
+    BasicTriMesh
+        The boolean union of all input meshes.
+    """
+
+    if not meshes:
+        return BasicTriMesh(np.zeros((0, 3), dtype=np.float64), np.zeros((0, 3), dtype=np.int32))
+
+    for i, m in enumerate(meshes):
+        if not _is_watertight(m):
+            #raise ValueError(f"Input meshes must be watertight - mesh {i} ({m.label}) failed the watertight test")
+            print(f"Input meshes must be watertight - mesh {i} ({m.label}) failed the watertight test")
+
+    def _to_meshlib(m: BasicTriMesh):
+        #m = m.swapped_winding_order()
+        mesh = mrmeshnumpy.meshFromFacesVerts(faces=m.faces, verts=m.verts)
+        return mesh
+
+    def _from_meshlib(m) -> BasicTriMesh:
+        verts = mrmeshnumpy.getNumpyVerts(m)
+        faces = mrmeshnumpy.getNumpyFaces(m.topology)
+        tri_mesh = BasicTriMesh(verts=verts, faces=faces)
+        #return tri_mesh.swapped_winding_order()
+        return tri_mesh
+
+    #meshes = [meshes[0], meshes[2], meshes[4], meshes[5]]
+
+    result = None
     for i, mesh in enumerate(meshes):
-        # deduplicate verts
-        mesh = mesh.deduplicated()
-        # Add points
-        point_tags = []
-        for vert_i, v in enumerate(mesh.verts):
-            tag = gmsh.model.occ.addPoint(float(v[0]), float(v[1]), float(v[2]))
-            point_tags.append(tag)
-        # Add triangles as surfaces
-        surf_tags_mesh = []
-        for f in mesh.faces:
-            l1 = gmsh.model.occ.addLine(point_tags[f[0]], point_tags[f[1]])
-            l2 = gmsh.model.occ.addLine(point_tags[f[1]], point_tags[f[2]])
-            l3 = gmsh.model.occ.addLine(point_tags[f[2]], point_tags[f[0]])
-            cl = gmsh.model.occ.addCurveLoop([l1, l2, l3])
-            surf = gmsh.model.occ.addPlaneSurface([cl])
-            surf_tags_mesh.append((2, surf))
-        surf_tags.extend(surf_tags_mesh)
+        if result is None:
+            result = _to_meshlib(mesh)
+        else:
+            result = mrmeshpy.boolean(result, _to_meshlib(mesh), mrmeshpy.BooleanOperation.Union).mesh
+            print("merged", i, "-> ", len(mrmeshnumpy.getNumpyVerts(result)), "verts, ", mrmeshnumpy.getNumpyFaces(result.topology).shape[0], "faces")
+            if debug_save_path is not None:
+                _from_meshlib(result).save(debug_save_path + '.pt_' + str(i) + '.ply')
 
-    gmsh.model.occ.synchronize()
+    result_trimesh = _from_meshlib(result)
+    if debug_save_path:
+        result_trimesh.save(debug_save_path)
+    return result_trimesh
 
-    # Boolean union (fuse) all surfaces
-    if len(surf_tags) > 1:
-        out = gmsh.model.occ.fuse(surf_tags[:1], surf_tags[1:])
-        merged_tags = out[0]
+
+
+def _stale____():
+
+    def _to_manifold(m: BasicTriMesh) -> manifold3d.Manifold:
+        swapped_faces = m.faces.copy()
+        # swap winding order
+        swapped_faces[:, 1] = m.faces[:, 0]
+        swapped_faces[:, 0] = m.faces[:, 1]
+        mesh = manifold3d.Mesh(
+            vert_properties=np.asarray(m.verts, dtype=np.float32),
+            tri_verts=swapped_faces,
+        )
+        return manifold3d.Manifold(mesh=mesh)
+
+    manifolds = [_to_manifold(m) for m in meshes[0:1]]
+
+    if len(manifolds) == 1:
+        result_manifold = manifolds[0]
     else:
-        merged_tags = surf_tags
+        result_manifold = manifold3d.Manifold.batch_boolean(manifolds, manifold3d.OpType.Add)
 
-    gmsh.model.occ.synchronize()
-
-    # Generate mesh
-    gmsh.model.mesh.generate(2)
-
-    # Extract mesh nodes and elements
-    node_tags, node_coords, _ = gmsh.model.mesh.getNodes()
-    verts = np.array(node_coords, dtype=np.float64).reshape(-1, 3)
-    elem_types, elem_tags, elem_node_tags = gmsh.model.mesh.getElements(dim=2)
-    faces = np.array(elem_node_tags[0], dtype=np.int32).reshape(-1, 3) - 1  # gmsh is 1-based
+    out_mesh = result_manifold.to_mesh()
+    # vert_properties is (N, ≥3); first three columns are always XYZ
+    verts = np.asarray(out_mesh.vert_properties, dtype=np.float64)[:, :3]
+    faces = np.asarray(out_mesh.tri_verts, dtype=np.int32)
 
     if debug_save_path:
-        # save .msh
-        gmsh.write(debug_save_path)
-
-    gmsh.finalize()
+        import meshio
+        meshio.write_points_cells(
+            debug_save_path,
+            verts,
+            [("triangle", faces)],
+        )
 
     return BasicTriMesh(verts=verts, faces=faces)
 
+def build_boundary_layer_sdf(
+    surface_mesh: BasicTriMesh,
+    layer_thickness: float,
+    target_tet_count: int | None = None,
+    debug_save_path: str | None = None,
+):
+    # build a (SDF) signed distance field by voxelizing surface_mesh
+    resolution = 0.005
+    padding = layer_thickness + 2 * resolution  # ensure the iso-surface fits inside the grid
+
+    ml_mesh = mrmeshnumpy.meshFromFacesVerts(faces=surface_mesh.faces, verts=surface_mesh.verts)
+    bb = ml_mesh.computeBoundingBox()
+
+    origin = mrmeshpy.Vector3f(
+        bb.min.x - padding,
+        bb.min.y - padding,
+        bb.min.z - padding,
+    )
+    dims = mrmeshpy.Vector3i(
+        int(np.ceil((bb.max.x - bb.min.x + 2 * padding) / resolution)) + 1,
+        int(np.ceil((bb.max.y - bb.min.y + 2 * padding) / resolution)) + 1,
+        int(np.ceil((bb.max.z - bb.min.z + 2 * padding) / resolution)) + 1,
+    )
+
+    vol_params = mrmeshpy.DistanceVolumeParams()
+    vol_params.origin = origin
+    vol_params.voxelSize = mrmeshpy.Vector3f(resolution, resolution, resolution)
+    vol_params.dimensions = dims
+
+    dist_opts = mrmeshpy.SignedDistanceToMeshOptions()
+    dist_opts.signMode = mrmeshpy.SignDetectionMode.HoleWindingRule
+    # compute distances precisely up to 3× layer thickness; approximate beyond
+    dist_opts.maxDistSq = float((layer_thickness * 3) ** 2)
+    dist_opts.nullOutsideMinMax = False  # keep approximate values so marching cubes finds a closed surface
+
+    sdf_params = mrmeshpy.MeshToDistanceVolumeParams()
+    sdf_params.vol = vol_params
+    sdf_params.dist = dist_opts
+
+    sdf_volume = mrmeshpy.meshToDistanceVolume(ml_mesh, sdf_params)
+
+    # smooth the sdf
+    # 1. lift the dense SimpleVolumeMinMax grid into an OpenVDB sparse grid (VdbVolume), which is what voxelFilter requires
+    _vdb = mrmeshpy.simpleVolumeToVdbVolume(sdf_volume)
+    # 2. apply a 3-voxel-wide Gaussian kernel (σ ≈ 1 voxel), smoothing out surface noise and staircase artefacts from the voxelisation
+    _vdb = mrmeshpy.voxelFilter(_vdb, mrmeshpy.VoxelFilterType.Gaussian, 3)
+    # 3. convert back to dense SimpleVolumeMinMax
+    sdf_volume = mrmeshpy.vdbVolumeToSimpleVolume(_vdb)
+
+    # find the surface of the SDF -> skin mesh
+    # Extract the iso-surface at level 0: a clean, watertight reconstruction
+    # of the original surface mesh, suitable for remeshing and extrusion.
+    mc_params = mrmeshpy.MarchingCubesParams()
+    mc_params.iso = 0.0
+    mc_params.lessInside = True  # required for signed distance volumes
+    mc_params.origin = origin    # must match the SDF grid origin
+
+    skin_ml = mrmeshpy.marchingCubes(sdf_volume, mc_params)
+    skin_verts = mrmeshnumpy.getNumpyVerts(skin_ml)
+    skin_faces = mrmeshnumpy.getNumpyFaces(skin_ml.topology)
+    surface_mesh = BasicTriMesh(verts=skin_verts, faces=skin_faces)
+    if debug_save_path:
+        surface_mesh.save(debug_save_path + ".surface.ply")
+
+    # remesh the skin mesh and extrude to tets
+    heights = [layer_thickness]
+    e = _target_edge_len(surface_mesh, target_tet_count, n_layers=1)
+    surface_mesh = _remesh_surface(surface_mesh, e)
+    return _extrude_to_tets(surface_mesh, heights, debug_save_path=debug_save_path)
 
 def build_boundary_layer(
     surface_mesh: BasicTriMesh,

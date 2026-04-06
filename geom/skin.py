@@ -129,20 +129,24 @@ def generate_skin_shell(
 
     # ── 1. Boolean merge all anatomy meshes → merged_surface ──────────────
     merge_inputs: list[df.Mesh] = []
-    for v, f in [
-        (clav_l_v, clav_l_f), (clav_r_v, clav_r_f),
-        (arm_l_v,  arm_l_f),  (arm_r_v,  arm_r_f),
-        (rc_v,     rc_f),     (bl_v,     bl_f),
-        (br_v,     br_f),
+    for v, f, label in [
+        (rc_v, rc_f, 'ribcage'),
+        (bl_v, bl_f, 'breast_l'),
+        (br_v, br_f, 'breast_r'),
+        (clav_l_v, clav_l_f, 'clav_l'), (clav_r_v, clav_r_f, 'clav_r'),
+        (arm_l_v,  arm_l_f, 'arm_l'),  (arm_r_v,  arm_r_f, 'arm_r'),
     ]:
         if len(v) > 0 and len(f) > 0:
-            merge_inputs.append(df.BasicTriMesh(verts=v, faces=f))
+            btr = df.BasicTriMesh(verts=v, faces=f, label=label)
+            if label == 'ribcage':
+                btr = btr.deduplicated()
+            merge_inputs.append(btr)
 
     if not merge_inputs:
         return []
 
     print(f"[generate_skin_shell] Boolean-merging {len(merge_inputs)} anatomy meshes...")
-    merged_surface = df.boolean_merge_meshes(merge_inputs, debug_save_path="generate_skin_shell.msh")
+    merged_surface = df.boolean_merge_meshes(merge_inputs, debug_save_path="generate_skin_shell.ply")
     print(f"[generate_skin_shell] Merged surface: {len(merged_surface.verts)} verts, "
           f"{len(merged_surface.faces)} faces")
 
@@ -154,11 +158,11 @@ def generate_skin_shell(
     # where N=1 is hardcoded in build_boundary_layer.
     print(f"[generate_skin_shell] Building boundary layer "
           f"(target_n_tets={target_n_tets}, thickness={thickness})…")
-    shell = df.build_boundary_layer(
+    shell = df.build_boundary_layer_sdf(
         merged_surface,
         layer_thickness=thickness,
-        reparamterize_target_tet_count=target_n_tets,
-        remesh_surface=True,
+        target_tet_count=target_n_tets,
+        debug_save_path="generate_skin_shell_sdf.msh"
     )
     n_v         = len(shell.verts) // 2   # N=1 → two equal rings
     inner_verts = shell.verts[:n_v]       # (n_v, 3) – on the merged-surface side

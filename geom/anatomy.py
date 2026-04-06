@@ -71,7 +71,7 @@ def _clavicle_capsule_verts_local():
     Returns verts (N,3), faces (M,3), lateral_surf_idx (indices of cylinder
     surface verts on the lateral half, used as Cooper's ligament anchors).
     """
-    clavicle_mesh = _make_capsule(length=_CLAVICLE_LENGTH, radius=0.007, rings=8, segs=10)
+    clavicle_mesh = _make_capsule(length=_CLAVICLE_LENGTH, radius=0.02, rings=8, segs=10, long_axis='x')
     return clavicle_mesh
 
 # ---------------------------------------------------------------------------
@@ -116,7 +116,7 @@ def _make_upper_arm_capsule(length=_UPPER_ARM_LENGTH, radius=_UPPER_ARM_RADIUS,
     return _make_capsule(length=length, radius=radius, rings=rings, segs=segs)
 
 
-def _make_capsule(length, radius, rings=8, segs=12) -> BasicTriMesh:
+def _make_capsule(length, radius, rings=8, segs=12, long_axis='-y') -> BasicTriMesh:
     """
     Capsule with long axis along −y (anatomical hanging position).
     """
@@ -125,14 +125,21 @@ def _make_capsule(length, radius, rings=8, segs=12) -> BasicTriMesh:
     import numpy as np
     gmsh.initialize()
     gmsh.model.add("upper_arm_capsule")
-    # Cylinder axis: from (0, 0, 0) to (0, -length, 0)
-    cyl = gmsh.model.occ.addCylinder(0, 0, 0, 0, -length, 0, radius)
+    if long_axis == '-y':
+        end = [0, -length, 0]
+    elif long_axis == 'x':
+        end = [length, 0, 0]
+    else:
+        print(f"Unrecognized long_axis {long_axis} -> using x")
+        end = [length, 0, 0]
+    # Cylinder axis: from (0, 0, 0) to end
+    cyl = gmsh.model.occ.addCylinder(0, 0, 0, end[0], end[1], end[2], radius)
     # Proximal hemisphere (shoulder)
     sph_prox = gmsh.model.occ.addSphere(0, 0, 0, radius)
     # Distal hemisphere (elbow)
-    sph_dist = gmsh.model.occ.addSphere(0, -length, 0, radius)
+    sph_dist = gmsh.model.occ.addSphere(end[0], end[1], end[2], radius)
     # Fragment to get a capsule
-    gmsh.model.occ.fragment([(3, cyl)], [(3, sph_prox), (3, sph_dist)])
+    gmsh.model.occ.fuse([(3, cyl)], [(3, sph_prox), (3, sph_dist)], removeObject=True, removeTool=True)
     gmsh.model.occ.synchronize()
     # Mesh options
     gmsh.model.mesh.generate(2)
@@ -182,6 +189,8 @@ def _fascia_verts_local(rows=6, cols=6,
             p = (1.0 - t) * top_pt + t * bot_pt
             verts.append(p)
 
+    swap_ab = top_x0 < top_x1
+    swap_cd = top_x0 < bot_x1
     faces = []
     for ri in range(rows - 1):
         for ci in range(cols - 1):
@@ -189,7 +198,9 @@ def _fascia_verts_local(rows=6, cols=6,
             b = ri * cols + ci + 1
             c = (ri + 1) * cols + ci
             d = (ri + 1) * cols + ci + 1
-            faces += [[a, b, c], [b, d, c]]
+            face0 = [b, a, c] if swap_ab else [a, b, c]
+            face1 = [b, c, d] if swap_cd else [b, d, c]
+            faces += [face0, face1]
 
     verts = np.array(verts, dtype=np.float32)
     faces = np.array(faces, dtype=np.int32)
@@ -234,7 +245,7 @@ class Skeleton:
 
         # ── local geometray ────────────────────────────────────────────────
         self._clavicle_l = _clavicle_capsule_verts_local()
-        self._clavicle_r = _clavicle_capsule_verts_local()
+        self._clavicle_r = _clavicle_capsule_verts_local().mirrored_x()
 
         # ── fascia local geometry (left side, positive x) ──────────────────
         _FASCIA_ROWS = 6
@@ -339,12 +350,8 @@ class Skeleton:
 
         self._clavicle_l_world = self._transform_verts(
             self._clavicle_l.verts, R_l, self._clavicle_l_offset)
-
-        # Right bone: flip x so it extends toward -x (right shoulder)
-        clavicle_r_local_mirrored = self._clavicle_r.verts.copy()
-        clavicle_r_local_mirrored[:, 0] *= -1
         self._clavicle_r_world = self._transform_verts(
-            clavicle_r_local_mirrored, R_r, self._clavicle_r_offset)
+            self._clavicle_r.verts, R_r, self._clavicle_r_offset)
 
         self.clavicle_l_v.from_numpy(self._clavicle_l_world)
         self.clavicle_r_v.from_numpy(self._clavicle_r_world)
@@ -550,22 +557,22 @@ class Skeleton:
                          upper_arm=(0.82, 0.65, 0.55)):
         def draw_clavicle_l(scene):
             scene.mesh(self.clavicle_l_v, self.clavicle_l_f,
-                       color=clavicle, two_sided=True)
+                       color=clavicle, two_sided=False)
         def draw_clavicle_r(scene):
             scene.mesh(self.clavicle_r_v, self.clavicle_r_f,
-                       color=clavicle, two_sided=True)
+                       color=clavicle, two_sided=False)
         def draw_fascia_l(scene):
             scene.mesh(self.fascia_l_v, self.fascia_l_f_ti,
-                       color=fascia, two_sided=True)
+                       color=fascia, two_sided=False)
         def draw_fascia_r(scene):
             scene.mesh(self.fascia_r_v, self.fascia_r_f_ti,
-                       color=fascia, two_sided=True)
+                       color=fascia, two_sided=False)
         def draw_upper_arm_l(scene):
             scene.mesh(self.upper_arm_l_v, self.upper_arm_l_f,
-                       color=upper_arm, two_sided=True)
+                       color=upper_arm, two_sided=False)
         def draw_upper_arm_r(scene):
             scene.mesh(self.upper_arm_r_v, self.upper_arm_r_f,
-                       color=upper_arm, two_sided=True)
+                       color=upper_arm, two_sided=False)
         return [draw_clavicle_l, draw_clavicle_r,
                 draw_fascia_l,   draw_fascia_r,
                 draw_upper_arm_l, draw_upper_arm_r]
