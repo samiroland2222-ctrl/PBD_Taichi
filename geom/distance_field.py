@@ -377,7 +377,7 @@ def build_boundary_layer_sdf(
 ):
     # build a (SDF) signed distance field by voxelizing surface_mesh
     resolution = 0.005
-    padding = layer_thickness + 2 * resolution  # ensure the iso-surface fits inside the grid
+    padding = layer_thickness + 20 * resolution  # ensure the iso-surface fits inside the grid
 
     ml_mesh = mrmeshnumpy.meshFromFacesVerts(faces=surface_mesh.faces, verts=surface_mesh.verts)
     bb = ml_mesh.computeBoundingBox()
@@ -411,11 +411,9 @@ def build_boundary_layer_sdf(
     sdf_volume = mrmeshpy.meshToDistanceVolume(ml_mesh, sdf_params)
 
     # smooth the sdf
-    # 1. lift the dense SimpleVolumeMinMax grid into an OpenVDB sparse grid (VdbVolume), which is what voxelFilter requires
+    # SimpleVolumeMinMax → VdbVolume → Gaussian filter (width=3 voxels) → SimpleVolumeMinMax
     _vdb = mrmeshpy.simpleVolumeToVdbVolume(sdf_volume)
-    # 2. apply a 3-voxel-wide Gaussian kernel (σ ≈ 1 voxel), smoothing out surface noise and staircase artefacts from the voxelisation
     _vdb = mrmeshpy.voxelFilter(_vdb, mrmeshpy.VoxelFilterType.Gaussian, 3)
-    # 3. convert back to dense SimpleVolumeMinMax
     sdf_volume = mrmeshpy.vdbVolumeToSimpleVolume(_vdb)
 
     # find the surface of the SDF -> skin mesh
@@ -429,6 +427,30 @@ def build_boundary_layer_sdf(
     skin_ml = mrmeshpy.marchingCubes(sdf_volume, mc_params)
     skin_verts = mrmeshnumpy.getNumpyVerts(skin_ml)
     skin_faces = mrmeshnumpy.getNumpyFaces(skin_ml.topology)
+
+    # The Gaussian blur blends SDF values with implicit zeros outside the grid
+    # boundary, which can push edge-voxel values through zero and create a
+    # spurious closed shell at the volume boundary.  Remove any face whose
+    # vertices fall within `margin` of the grid edge — the real iso-surface is
+    # always deeper inside the grid thanks to `padding`.
+    vol_min = np.array([origin.x, origin.y, origin.z])
+    vol_max = vol_min + np.array([dims.x, dims.y, dims.z]) * resolution
+    margin = 4 * resolution          # 4-voxel safety strip around the grid edge
+    inner_min = vol_min + margin
+    inner_max = vol_max - margin
+    face_verts_3d = skin_verts[skin_faces]           # (F, 3, 3)
+    keep = np.all(
+        (face_verts_3d >= inner_min) & (face_verts_3d <= inner_max),
+        axis=(1, 2),
+    )
+    skin_faces = skin_faces[keep]
+    if skin_faces.size > 0:
+        used = np.unique(skin_faces)
+        remap = np.full(len(skin_verts), -1, dtype=np.int32)
+        remap[used] = np.arange(len(used), dtype=np.int32)
+        skin_verts = skin_verts[used]
+        skin_faces = remap[skin_faces]
+
     surface_mesh = BasicTriMesh(verts=skin_verts, faces=skin_faces)
     if debug_save_path:
         surface_mesh.save(debug_save_path + ".surface.ply")

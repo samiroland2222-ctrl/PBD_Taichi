@@ -134,7 +134,7 @@ def generate_skin_shell(
         (bl_v, bl_f, 'breast_l'),
         (br_v, br_f, 'breast_r'),
         (clav_l_v, clav_l_f, 'clav_l'), (clav_r_v, clav_r_f, 'clav_r'),
-        (arm_l_v,  arm_l_f, 'arm_l'),  (arm_r_v,  arm_r_f, 'arm_r'),
+        #(arm_l_v,  arm_l_f, 'arm_l'),  (arm_r_v,  arm_r_f, 'arm_r'),
     ]:
         if len(v) > 0 and len(f) > 0:
             btr = df.BasicTriMesh(verts=v, faces=f, label=label)

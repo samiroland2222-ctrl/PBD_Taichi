@@ -271,7 +271,7 @@ class Skeleton:
 
         # ── joint offsets from chest_pos ──────────────────────────────────
         # Sternoclavicular joint sits at the manubrium, level with R1.
-        # In local coords (relative to chest_pos): x ≈ ±0.010, y ≈ +0.035, z = 0.
+        # In local coords (relative to chest_pos): x ≈ ±0.010, y ≈ +0.025, z = 0.
         # The clavicle has a natural superior bow (~5°) and slight anterior curve,
         # represented by the pitch DOF; the rest pose here is anatomical neutral.
         self._clavicle_l_offset = np.array([ 0.010,  0.035, 0.0], dtype=np.float32)
@@ -557,7 +557,7 @@ class Skeleton:
                          upper_arm=(0.82, 0.65, 0.55)):
         def draw_clavicle_l(scene):
             scene.mesh(self.clavicle_l_v, self.clavicle_l_f,
-                       color=clavicle, two_sided=False)
+                       color=clavicle, two_sided=False, show_wireframe=True)
         def draw_clavicle_r(scene):
             scene.mesh(self.clavicle_r_v, self.clavicle_r_f,
                        color=clavicle, two_sided=False)

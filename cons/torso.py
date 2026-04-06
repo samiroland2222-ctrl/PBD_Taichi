@@ -116,8 +116,6 @@ class UnifiedTorso:
         self.skin_shell: BasicTetMesh = skin_shell
         self.barycentric_bindings: list[BarycentricBindingDefinition] = barycentric_bindings
 
-        self.skin_shell = None
-
         # ── 3. merge breast meshes only (skin is visual-only for now) ─────
         merged_v, merged_t, merged_f = gtet.merge_numpy(
             (v_l, t_l, f_l),

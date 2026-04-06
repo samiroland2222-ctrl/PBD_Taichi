@@ -31,8 +31,8 @@ skeleton_mesh = _load_mesh(
 
 ribcage_mesh = _load_mesh(
     filepath=os.path.join(os.getcwd(), 'assets', 'mesh', 'ribcage.obj'),
-    scale=1/50,
-    repose=(-0.006, 0.04, -0.08)
+    scale=1/49,
+    repose=(-0.006, 0.04, -0.085)
 )
 
 # ── Skeleton (clavicles + upper arms) ─────────────────────────────────────────
@@ -64,7 +64,7 @@ torso = UnifiedTorso(
     breast_target_tets=300,
     ribcage_verts_np=ribcage_verts,
     ribcage_faces_np=ribcage_mesh.faces_np,
-    skin_target_n_tets=1200,
+    skin_target_n_tets=2400,
     skin_thickness=0.01,
     g=g,
     dt=dt,
