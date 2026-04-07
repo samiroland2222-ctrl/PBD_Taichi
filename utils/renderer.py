@@ -5,6 +5,34 @@ import numpy as np
 import time
 
 
+class _SceneProxy:
+    """Thin wrapper around a ``ti.ui.Scene`` that can force ``two_sided=True``
+    on every ``mesh()`` call.  All other attribute accesses are forwarded
+    transparently to the real scene object.
+
+    Used by ``TaichiRenderer3D`` to make the X-slice cross-section visible:
+    when the near clip plane cuts through geometry the back-faces are exposed,
+    so they must be lit to see the interior layers.
+    """
+
+    def __init__(self, scene, force_two_sided: bool = False):
+        # Store on __dict__ directly to avoid triggering our own __setattr__
+        object.__setattr__(self, '_scene', scene)
+        object.__setattr__(self, '_force_two_sided', force_two_sided)
+
+    def mesh(self, vertices, indices, *args, **kwargs):
+        if object.__getattribute__(self, '_force_two_sided'):
+            kwargs['two_sided'] = True
+        return object.__getattribute__(self, '_scene').mesh(
+            vertices, indices, *args, **kwargs)
+
+    def __getattr__(self, name):
+        return getattr(object.__getattribute__(self, '_scene'), name)
+
+    def __setattr__(self, name, value):
+        setattr(object.__getattribute__(self, '_scene'), name, value)
+
+
 class TaichiRenderer3D:
 
   def __init__(self,
@@ -32,6 +60,14 @@ class TaichiRenderer3D:
     self.gui_list = []
     self.scene_render_list = []
 
+    # ── Topological X-slice ────────────────────────────────────────────
+    # When enabled, the near clip plane is recomputed every frame so that
+    # it passes through (clip_x, 0, 0) in world space, letting you see
+    # a cross-section through all layers at that X position.
+    self.clip_plane_enabled = False
+    self.clip_x             = 0.0
+    self._z_near_default    = 0.001   # metres – used when slice is off
+
     def print_camera_info():
       print("Camera position: ", self.camera.curr_position)
       print("Camera look at: ", self.camera.curr_lookat)
@@ -49,6 +85,36 @@ class TaichiRenderer3D:
 
   def add_scene_render_draw(self, scene_render_draw_call):
     self.scene_render_list.append(scene_render_draw_call)
+
+  # ── X-slice clip plane ─────────────────────────────────────────────────────
+  def _update_clip_plane(self):
+    """Adjust the near clip plane every frame.
+
+    When ``clip_plane_enabled`` is True the near clip plane is moved so it
+    passes through ``(clip_x, 0, 0)`` in world space along the current view
+    direction, creating a topological cross-section through all layers.
+    When disabled the near clip plane is reset to ``_z_near_default``.
+    """
+    if not self.clip_plane_enabled:
+      self.camera.z_near(self._z_near_default)
+      return
+
+    cam_pos  = np.array(self.camera.curr_position, dtype=np.float64)
+    cam_look = np.array(self.camera.curr_lookat,   dtype=np.float64)
+    view_dir = cam_look - cam_pos
+    norm = float(np.linalg.norm(view_dir))
+    if norm < 1e-8:
+      self.camera.z_near(self._z_near_default)
+      return
+    view_dir /= norm
+
+    # Signed distance from the camera to the world point (clip_x, 0, 0)
+    # projected onto the view direction.
+    world_pt = np.array([self.clip_x, 0.0, 0.0], dtype=np.float64)
+    z = float(np.dot(world_pt - cam_pos, view_dir))
+    # z_near must be strictly positive; if the slice point is behind the
+    # camera we fall back to the default (nothing gets clipped).
+    self.camera.z_near(max(z, self._z_near_default))
 
   def handle_input(self):
     if self.window.get_event(ti.ui.PRESS):
@@ -68,13 +134,14 @@ class TaichiRenderer3D:
         print("Camera position: ", self.camera.curr_position)
         print("Camera look at: ", self.camera.curr_lookat)
         print("Camera up: ", self.camera.curr_up)
+    self._update_clip_plane()
     self.scene.set_camera(self.camera)
     self.scene.ambient_light((0.8, 0.8, 0.8))
     self.scene.point_light(pos=self.camera.curr_position, color=(1, 1, 1))
     self.scene.ambient_light([0.2, 0.2, 0.2])
 
     for scene_render_draw in self.scene_render_list:
-      scene_render_draw(self.scene)
+      scene_render_draw(_SceneProxy(self.scene, self.clip_plane_enabled))
 
     self.canvas.scene(self.scene)
 
@@ -82,6 +149,17 @@ class TaichiRenderer3D:
       with self.gui.sub_window('gui', 0.0, 0.0, 0.3, 0.4):
         for gui_draw in self.gui_list:
           gui_draw(self.gui)
+
+    # ── X-slice controls (always visible) ─────────────────────────────
+    with self.gui.sub_window('X-Slice', 0.0, 0.41, 0.3, 0.12):
+      self.clip_plane_enabled = self.gui.checkbox(
+          "Enable X-slice", self.clip_plane_enabled)
+      if self.clip_plane_enabled:
+        self.clip_x = self.gui.slider_float(
+            "clip_x", self.clip_x, -0.5, 0.5)
+        self.gui.text(f"  near clip @ x = {self.clip_x:.3f} m")
+      else:
+        self.gui.text("  (disabled – near clip = default)")
 
     self.window.show()
 

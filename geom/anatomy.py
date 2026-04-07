@@ -155,7 +155,7 @@ def _make_capsule(length, radius, rings=8, segs=12, long_axis='-y') -> BasicTriM
 # Clavipectoral fascia quad surface
 # ---------------------------------------------------------------------------
 
-def _fascia_verts_local(rows=6, cols=6,
+def _fascia_verts_local(rows=6, cols=10,
                          top_x0=0.02, top_x1=0.16,
                          top_y=0.0,   top_z=0.02,
                          bot_x0=0.01, bot_x1=0.14,
@@ -256,7 +256,7 @@ class Skeleton:
              top_x0=0.0,   top_x1=0.136,   # along clavicle local-x (medial→lateral)
              top_y=0.0,    top_z=0.0,       # top edge at clavicle pivot origin
              bot_x0=0.01,  bot_x1=0.1,    # chest-local bottom edge
-             bot_y=-0.11,
+             bot_y=-0.21,
              bot_z0=0.04, bot_z1=-0.0)
 
         # Right fascia: mirror x — top runs from 0 toward -0.136
@@ -266,7 +266,7 @@ class Skeleton:
              top_x0=0.0,    top_x1=-0.136,
              top_y=0.0,     top_z=0.0,
              bot_x0=-0.01,  bot_x1=-0.1,
-             bot_y=-0.11,
+             bot_y=-0.21,
              bot_z0=0.04, bot_z1=-0.0)
 
         # ── joint offsets from chest_pos ──────────────────────────────────
