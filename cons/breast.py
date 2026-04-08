@@ -49,20 +49,19 @@ class Breast:
 
     @classmethod
     def make_numpy(cls, rho=1.0, scale=1.0, spread=0.0, back_distance=0.125, tilt=0.2,
-                   radius=0.07, height=0.06, k=0.7, target_tets=300):
+                   radius=0.07, height=0.06, k=0.7, k2=0.2, target_tets=300):
         """Generate breast mesh data as numpy arrays, without creating Taichi fields.
 
         Returns (v, t_flat, f_flat, base_idx, top_idx).
         Vertices are already scaled by *scale*.
         """
-        coords, node_tags, tet_node_tags, _ = breast_mesh_generator.generate_breast_msh(
-            radius=radius, height=height, k=k, target_tets=target_tets)
+        coords, node_tags, tet_node_tags, tet_tags, base_vert_index = breast_mesh_generator.generate_breast_msh(
+            radius=radius, height=height, k=k, k2=k2, target_tets=target_tets, debug_save_path="breast.msh")
 
         tag_to_idx = {tag: i for i, tag in enumerate(node_tags)}
         v = coords.astype(np.float64)
 
-        z_min, z_max = v[:, 2].min(), v[:, 2].max()
-        base_idx = np.where(v[:, 2] <= z_min + (z_max - z_min) * 0.02)[0].astype(np.int32)
+        base_idx = base_vert_index.astype(np.int32)
         all_idx = np.arange(len(node_tags))
         top_idx = np.setdiff1d(all_idx, base_idx)
 

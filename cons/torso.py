@@ -54,7 +54,7 @@ class UnifiedTorso:
         skeleton,
         *,
         breast_height=0.05,
-        breast_radius=0.08,
+        breast_radius=0.06,
         breast_k=0.7,
         breast_spread=0.5,
         breast_tilt=0.2,
@@ -206,12 +206,21 @@ class UnifiedTorso:
         self.base_r = base_r + self.right_offset
         self.top_r  = top_r  + self.right_offset
 
-        # ── 4. no hard pins for breast bases (held by fascia springs below) ─
-        pin_np = np.zeros(0, dtype=np.int32)
-        _pin_dummy = ti.field(dtype=ti.i32, shape=1)
-        self.mesh.set_fixed_point(0, _pin_dummy)   # noop – loops 0 times
-        self._pin_np = pin_np
-        self._pin_ti = _pin_dummy
+        # ── 4. hard pins for breast bases (alternatively: held by fascia springs below) ─
+        breast_base_hard_pin = True
+        if breast_base_hard_pin:
+            pin_idx = list(self.base_l) + list(self.base_r)
+            pin_np = np.array(pin_idx, dtype=np.int32)
+            pin_ti = ti.field(dtype=ti.i32, shape=len(pin_np))
+            pin_ti.from_numpy(pin_np)
+            self._pin_ti = pin_ti
+            self.mesh.set_fixed_point(len(pin_np), pin_ti)
+        else:
+            pin_np = np.zeros(0, dtype=np.int32)
+            _pin_dummy = ti.field(dtype=ti.i32, shape=1)
+            self.mesh.set_fixed_point(0, _pin_dummy)   # noop – loops 0 times
+            self._pin_np = pin_np
+            self._pin_ti = _pin_dummy
 
         self.breast_l = BreastRegion(self.mesh, self.base_l, self.top_l)
         self.breast_r = BreastRegion(self.mesh, self.base_r, self.top_r)
@@ -258,16 +267,19 @@ class UnifiedTorso:
             self.deform_skin    = None
 
         # ── 6. Cooper's ligaments ─────────────────────────────────────────
-        self.ligaments_l, _ = coopers.build_coopers(
-            skeleton=skeleton, breast=self.breast_l, dt=dt,
-            alpha=1e3, pull_only=True, max_attach_dist=0.5,
-            n_ligaments=90, pretension=1.0, side='left')
-        self.xpbd.add_cons(self.ligaments_l)
-        self.ligaments_r, _ = coopers.build_coopers(
-            skeleton=skeleton, breast=self.breast_r, dt=dt,
-            alpha=1e3, pull_only=True, max_attach_dist=0.5,
-            n_ligaments=90, pretension=1.0, side='right')
-        self.xpbd.add_cons(self.ligaments_r)
+        if not breast_base_hard_pin:
+            self.ligaments_l, _ = coopers.build_coopers(
+                skeleton=skeleton, breast=self.breast_l, dt=dt,
+                alpha=1e3, pull_only=True, max_attach_dist=0.5,
+                n_ligaments=90, pretension=1.0, side='left')
+            self.xpbd.add_cons(self.ligaments_l)
+            self.ligaments_r, _ = coopers.build_coopers(
+                skeleton=skeleton, breast=self.breast_r, dt=dt,
+                alpha=1e3, pull_only=True, max_attach_dist=0.5,
+                n_ligaments=90, pretension=1.0, side='right')
+            self.xpbd.add_cons(self.ligaments_r)
+        else:
+            self.ligaments_l = None
 
         # ── 7. skin constraints built from barycentric_bindings ──────────
         bl_faces = f_l.reshape(-1, 3)   # (F, 3) local breast-L face indices
@@ -350,32 +362,36 @@ class UnifiedTorso:
         # 7d. KinematicSkinSpringConstraint – breast base verts → fascia surface
         #     Replaces the old hard-pin: breast base follows the clavipectoral
         #     fascia barycentrically as the skeleton moves.
-        def _fascia_init_targets(v_np, faces, tri_idx, uvw):
-            if len(tri_idx) == 0:
-                return np.zeros((0, 3), dtype=np.float32)
-            f = faces[tri_idx]
-            return (uvw[:, 0:1] * v_np[f[:, 0]]
-                    + uvw[:, 1:2] * v_np[f[:, 1]]
-                    + uvw[:, 2:3] * v_np[f[:, 2]]).astype(np.float32)
+        if breast_base_hard_pin:
+            self.breast_l_fascia_springs = None
+            self.breast_r_fascia_springs = None
+        else:
+            def _fascia_init_targets(v_np, faces, tri_idx, uvw):
+                if len(tri_idx) == 0:
+                    return np.zeros((0, 3), dtype=np.float32)
+                f = faces[tri_idx]
+                return (uvw[:, 0:1] * v_np[f[:, 0]]
+                        + uvw[:, 1:2] * v_np[f[:, 1]]
+                        + uvw[:, 2:3] * v_np[f[:, 2]]).astype(np.float32)
 
-        init_tgts_l = _fascia_init_targets(
-            fascia_l_v_np, fascia_l_f, best_tri_l, best_uvw_l)
-        init_tgts_r = _fascia_init_targets(
-            fascia_r_v_np, fascia_r_f, best_tri_r, best_uvw_r)
+            init_tgts_l = _fascia_init_targets(
+                fascia_l_v_np, fascia_l_f, best_tri_l, best_uvw_l)
+            init_tgts_r = _fascia_init_targets(
+                fascia_r_v_np, fascia_r_f, best_tri_r, best_uvw_r)
 
-        self.breast_l_fascia_springs = KinematicSkinSpringConstraint(
-            v_p=self.mesh.v_p, v_invm=self.mesh.v_invm,
-            skin_idx_np=self.base_l.astype(np.int32),
-            init_target_np=init_tgts_l,
-            dt=dt, alpha=1e-4, pretension=1.0)
-        self.xpbd.add_cons(self.breast_l_fascia_springs)
+            self.breast_l_fascia_springs = KinematicSkinSpringConstraint(
+                v_p=self.mesh.v_p, v_invm=self.mesh.v_invm,
+                skin_idx_np=self.base_l.astype(np.int32),
+                init_target_np=init_tgts_l,
+                dt=dt, alpha=1e-4, pretension=1.0)
+            self.xpbd.add_cons(self.breast_l_fascia_springs)
 
-        self.breast_r_fascia_springs = KinematicSkinSpringConstraint(
-            v_p=self.mesh.v_p, v_invm=self.mesh.v_invm,
-            skin_idx_np=self.base_r.astype(np.int32),
-            init_target_np=init_tgts_r,
-            dt=dt, alpha=1e-4, pretension=1.0)
-        self.xpbd.add_cons(self.breast_r_fascia_springs)
+            self.breast_r_fascia_springs = KinematicSkinSpringConstraint(
+                v_p=self.mesh.v_p, v_invm=self.mesh.v_invm,
+                skin_idx_np=self.base_r.astype(np.int32),
+                init_target_np=init_tgts_r,
+                dt=dt, alpha=1e-4, pretension=1.0)
+            self.xpbd.add_cons(self.breast_r_fascia_springs)
 
         # ── 8. init rest status ───────────────────────────────────────────
         self.xpbd.init_rest_status()
@@ -398,12 +414,12 @@ class UnifiedTorso:
             self.ribcage_skin_springs.update_targets(rc_targets)
         # Fascia breast-base springs — targets follow the live skeleton fascia mesh
         sk = self.skeleton
-        if self.breast_l_fascia_springs.n > 0:
+        if self.breast_l_fascia_springs and self.breast_l_fascia_springs.n > 0:
             tgts_l = self._compute_fascia_targets(
                 sk.fascia_l_v.to_numpy().astype(np.float32),
                 self._fascia_l_faces, self._fascia_l_bind_tri, self._fascia_l_bind_uvw)
             self.breast_l_fascia_springs.update_targets(tgts_l)
-        if self.breast_r_fascia_springs.n > 0:
+        if self.breast_r_fascia_springs and self.breast_r_fascia_springs.n > 0:
             tgts_r = self._compute_fascia_targets(
                 sk.fascia_r_v.to_numpy().astype(np.float32),
                 self._fascia_r_faces, self._fascia_r_bind_tri, self._fascia_r_bind_uvw)
@@ -500,6 +516,8 @@ class UnifiedTorso:
         return [draw_skin]
 
     def get_ligament_draws(self):
+        if not self.ligaments_l:
+            return []
         return [self.ligaments_l.get_render_draw(),
                 self.ligaments_r.get_render_draw()]
 

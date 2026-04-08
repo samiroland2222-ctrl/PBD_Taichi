@@ -58,15 +58,15 @@ dt         = 1.0 / (fps * substep)
 ribcage_verts = ribcage_mesh.v_p.to_numpy()
 torso = UnifiedTorso(
     skel,
-    breast_height=0.06,
-    breast_radius=0.09,
+    breast_height=0.08,
+    breast_radius=0.04,
     breast_k=0.7,
     breast_spread=0.6,
     breast_tilt=0.2,
-    breast_target_tets=300,
+    breast_target_tets=600,
     ribcage_verts_np=ribcage_verts,
     ribcage_faces_np=ribcage_mesh.faces_np,
-    skin_target_n_tets=10000,
+    skin_target_n_tets=0,#10000,
     skin_thickness=0.01,
     g=g,
     dt=dt,
@@ -108,8 +108,8 @@ log_b_hydro   = [math.log10(torso.deform_breast.hydro_alpha)]
 log_b_devia   = [math.log10(torso.deform_breast.devia_alpha)]
 log_s_hydro   = [math.log10(torso.deform_skin.hydro_alpha)]  if torso.deform_skin else [math.log10(SKIN_HYDRO_ALPHA)]
 log_s_devia   = [math.log10(torso.deform_skin.devia_alpha)]  if torso.deform_skin else [math.log10(SKIN_DEVIA_ALPHA)]
-log_lig_alpha  = [math.log10(torso.ligaments_l.alpha)]
-log_fascia_alpha = [math.log10(torso.breast_l_fascia_springs.alpha)] if torso.breast_l_fascia_springs.n > 0 else [-4.0]
+log_lig_alpha  = [math.log10(torso.ligaments_l.alpha)] if torso.ligaments_l else [0.0]
+log_fascia_alpha = [math.log10(torso.breast_l_fascia_springs.alpha)] if torso.breast_l_fascia_springs and torso.breast_l_fascia_springs.n > 0 else [-4.0]
 log_skin_alpha = [math.log10(torso.skin_anchors.alpha)] if torso.skin_anchors.n > 0 else [0.0]
 log_skel_alpha = [math.log10(torso.skeleton_skin_springs.alpha)] if torso.skeleton_skin_springs.n > 0 else [0.0]
 log_rc_alpha   = [math.log10(torso.ribcage_skin_springs.alpha)] if torso.ribcage_skin_springs.n > 0 else [0.0]
@@ -132,11 +132,12 @@ def gui_draw(gui):
 
     gui.text("-- Cooper's ligaments --")
     log_lig_alpha[0] = gui.slider_float("log10(lig)", log_lig_alpha[0], -1.0, 6.0)
-    torso.ligaments_l.alpha = 10 ** log_lig_alpha[0]
-    torso.ligaments_r.alpha = 10 ** log_lig_alpha[0]
-    gui.text(f"  alpha={torso.ligaments_l.alpha:.2e}")
+    if torso.ligaments_l:
+        torso.ligaments_l.alpha = 10 ** log_lig_alpha[0]
+        torso.ligaments_r.alpha = 10 ** log_lig_alpha[0]
+        gui.text(f"  alpha={torso.ligaments_l.alpha:.2e}")
 
-    if torso.breast_l_fascia_springs.n > 0:
+    if torso.breast_l_fascia_springs and torso.breast_l_fascia_springs.n > 0:
         gui.text("-- Breast-base <-> fascia springs --")
         log_fascia_alpha[0] = gui.slider_float("log10(fascia)", log_fascia_alpha[0], -3.0, 6.0)
         torso.breast_l_fascia_springs.alpha = 10 ** log_fascia_alpha[0]
@@ -210,8 +211,9 @@ while tirender.window.running:
     # Update skeleton and kinematic skin anchors once per frame
     skel.update()
     torso.update_kinematic_skin()
-    torso.ligaments_l.update_anchors(skel.get_fascia_left_surface_anchors_np())
-    torso.ligaments_r.update_anchors(skel.get_fascia_right_surface_anchors_np())
+    if torso.ligaments_l:
+        torso.ligaments_l.update_anchors(skel.get_fascia_left_surface_anchors_np())
+        torso.ligaments_r.update_anchors(skel.get_fascia_right_surface_anchors_np())
 
     wall_now   = _time.time()
     wall_delta = wall_now - _wall_prev
