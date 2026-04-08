@@ -58,16 +58,16 @@ dt         = 1.0 / (fps * substep)
 ribcage_verts = ribcage_mesh.v_p.to_numpy()
 torso = UnifiedTorso(
     skel,
-    breast_height=0.08,
-    breast_radius=0.04,
-    breast_k=0.7,
+    breast_height=0.12,
+    breast_radius=0.06,
+    breast_k=1.0,
     breast_spread=0.6,
-    breast_tilt=0.2,
+    breast_tilt=0.3,
     breast_target_tets=600,
     ribcage_verts_np=ribcage_verts,
     ribcage_faces_np=ribcage_mesh.faces_np,
-    skin_target_n_tets=0,#10000,
-    skin_thickness=0.01,
+    skin_target_n_tets=10000,
+    skin_thickness=0.02,
     g=g,
     dt=dt,
     fps=fps,
@@ -75,7 +75,7 @@ torso = UnifiedTorso(
 )
 
 # ── Bounding box ──────────────────────────────────────────────────────────────
-all_v = torso.mesh.v_p.to_numpy()
+all_v = torso.skin_mesh.v_p.to_numpy()
 bb_np = np.array([[all_v[:, i].min() - 0.5, all_v[:, i].max() + 0.5]
                   for i in range(3)], dtype=np.float32)
 bb = ti.field(dtype=ti.f32, shape=(3, 2))
@@ -94,8 +94,8 @@ tirender.add_scene_render_draw(skeleton_mesh.get_render_draw(color=(0.7, 0.7, 0.
 tirender.add_scene_render_draw(ribcage_mesh.get_render_draw(color=(0.7, 0.7, 0.5), wireframe=False))
 for draw in torso.get_render_draws():
     tirender.add_scene_render_draw(draw)
-for draw in torso.get_skin_draws(color=(0.1, 1.0, 0.1)):          # raycast skin surface
-    tirender.add_scene_render_draw(draw)
+#for draw in torso.get_skin_draws(color=(0.1, 1.0, 0.1)):          # raycast skin surface
+#    tirender.add_scene_render_draw(draw)
 for draw in skel.get_render_draws():
     tirender.add_scene_render_draw(draw)
 for draw in torso.get_ligament_draws():
@@ -230,11 +230,11 @@ while tirender.window.running:
 
     if should_step:
         for _ in range(substep):
-            torso.xpbd.make_prediction_pinned(torso.mesh.v_invm)
+            torso.xpbd.make_prediction_pinned(torso.skin_mesh.v_invm)
             torso.xpbd.preupdate_cons()
             for _ in range(solve_step):
                 torso.xpbd.update_cons()
-            torso.xpbd.update_vel_pinned(torso.mesh.v_invm)
+            torso.xpbd.update_vel_pinned(torso.skin_mesh.v_invm)
         sim['frame'] += 1
 
     tirender.render()

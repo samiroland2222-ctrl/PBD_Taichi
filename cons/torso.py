@@ -32,6 +32,8 @@ from PBD_Taichi.geom.skin import AnchorType, BarycentricBindingDefinition
 # ---------------------------------------------------------------------------
 # UnifiedTorso
 # ---------------------------------------------------------------------------
+
+
 class UnifiedTorso:
     """
     Unified deformable body: left breast + right breast + skin shell.
@@ -183,8 +185,8 @@ class UnifiedTorso:
                 (v_l, t_l, f_l),
                 (v_r, t_r, f_r),
             )
-        self.mesh = gtet.TetMesh(v=merged_v, t=merged_t, f=merged_f,
-                                 rho=1.0, scale=1.0)
+        self.skin_mesh = gtet.TetMesh(v=merged_v, t=merged_t, f=merged_f,
+                                      rho=1.0, scale=1.0)
 
         # ── 3b. skin face-index field (global indices into unified mesh) ──
         if skin_f_surf is not None and len(skin_f_surf) > 0:
@@ -207,29 +209,29 @@ class UnifiedTorso:
         self.top_r  = top_r  + self.right_offset
 
         # ── 4. hard pins for breast bases (alternatively: held by fascia springs below) ─
-        breast_base_hard_pin = True
+        breast_base_hard_pin = False
         if breast_base_hard_pin:
             pin_idx = list(self.base_l) + list(self.base_r)
             pin_np = np.array(pin_idx, dtype=np.int32)
             pin_ti = ti.field(dtype=ti.i32, shape=len(pin_np))
             pin_ti.from_numpy(pin_np)
             self._pin_ti = pin_ti
-            self.mesh.set_fixed_point(len(pin_np), pin_ti)
+            self.skin_mesh.set_fixed_point(len(pin_np), pin_ti)
         else:
             pin_np = np.zeros(0, dtype=np.int32)
             _pin_dummy = ti.field(dtype=ti.i32, shape=1)
-            self.mesh.set_fixed_point(0, _pin_dummy)   # noop – loops 0 times
+            self.skin_mesh.set_fixed_point(0, _pin_dummy)   # noop – loops 0 times
             self._pin_np = pin_np
             self._pin_ti = _pin_dummy
 
-        self.breast_l = BreastRegion(self.mesh, self.base_l, self.top_l)
-        self.breast_r = BreastRegion(self.mesh, self.base_r, self.top_r)
+        self.breast_l = BreastRegion(self.skin_mesh, self.base_l, self.top_l)
+        self.breast_r = BreastRegion(self.skin_mesh, self.base_r, self.top_r)
 
         # ── 5. build PBD framework ────────────────────────────────────────
         g_vec = ti.Vector(list(g))
         self.xpbd = framework.pbd_framework(
-            g=g_vec, n_vert=self.mesh.n_vert, v_p=self.mesh.v_p,
-            dt=dt, damp=0.99, invm=self.mesh.v_invm)
+            g=g_vec, n_vert=self.skin_mesh.n_vert, v_p=self.skin_mesh.v_p,
+            dt=dt, damp=0.99, invm=self.skin_mesh.v_invm)
 
         # ── 5a. Deform3D for breast tets (breast L + breast R) ────────────
         n_breast_tets = self.n_left_tets + self.n_right_tets
@@ -237,14 +239,14 @@ class UnifiedTorso:
         self._breast_t_field = ti.field(dtype=ti.i32, shape=len(_breast_t_np))
         self._breast_t_field.from_numpy(_breast_t_np)
 
-        _tm_all = self.mesh.t_mass.to_numpy()
+        _tm_all = self.skin_mesh.t_mass.to_numpy()
         self._breast_tm_field = ti.field(dtype=ti.f32, shape=max(1, n_breast_tets))
         self._breast_tm_field.from_numpy(_tm_all[:n_breast_tets])
 
         self.deform_breast = deform3d.Deform3D(
             n=n_breast_tets, indices=self._breast_t_field,
-            invm=self.mesh.v_invm, pos=self.mesh.v_p,
-            pos_ref=self.mesh.v_p_ref, tet_mass=self._breast_tm_field,
+            invm=self.skin_mesh.v_invm, pos=self.skin_mesh.v_p,
+            pos_ref=self.skin_mesh.v_p_ref, tet_mass=self._breast_tm_field,
             dt=dt, hydro_alpha=1e-2, devia_alpha=1e1)
         self.xpbd.add_cons(self.deform_breast)
 
@@ -257,8 +259,8 @@ class UnifiedTorso:
             self._skin_tm_field.from_numpy(_tm_all[n_breast_tets:])
             self.deform_skin = deform3d.Deform3D(
                 n=self.n_skin_tets, indices=self._skin_t_field,
-                invm=self.mesh.v_invm, pos=self.mesh.v_p,
-                pos_ref=self.mesh.v_p_ref, tet_mass=self._skin_tm_field,
+                invm=self.skin_mesh.v_invm, pos=self.skin_mesh.v_p,
+                pos_ref=self.skin_mesh.v_p_ref, tet_mass=self._skin_tm_field,
                 dt=dt, hydro_alpha=SKIN_HYDRO_ALPHA, devia_alpha=SKIN_DEVIA_ALPHA)
             self.xpbd.add_cons(self.deform_skin)
         else:
@@ -311,7 +313,7 @@ class UnifiedTorso:
             uvw_np = np.zeros((0, 3), dtype=np.float32)
 
         self.skin_anchors = BaryBreastSkinConstraint(
-            v_p=self.mesh.v_p, v_invm=self.mesh.v_invm,
+            v_p=self.skin_mesh.v_p, v_invm=self.skin_mesh.v_invm,
             skin_idx_np=skin_idx_np,
             tri_v0_np=v0_np, tri_v1_np=v1_np, tri_v2_np=v2_np,
             bary_uvw_np=uvw_np,
@@ -333,7 +335,7 @@ class UnifiedTorso:
             init_targets = np.zeros((0, 3), dtype=np.float32)
 
         self.skeleton_skin_springs = KinematicSkinSpringConstraint(
-            v_p=self.mesh.v_p, v_invm=self.mesh.v_invm,
+            v_p=self.skin_mesh.v_p, v_invm=self.skin_mesh.v_invm,
             skin_idx_np=kin_skin_idx, init_target_np=init_targets,
             dt=dt, alpha=1e-3, pretension=1.0)
         self.xpbd.add_cons(self.skeleton_skin_springs)
@@ -354,7 +356,7 @@ class UnifiedTorso:
             rc_init_targets = np.zeros((0, 3), dtype=np.float32)
 
         self.ribcage_skin_springs = KinematicSkinSpringConstraint(
-            v_p=self.mesh.v_p, v_invm=self.mesh.v_invm,
+            v_p=self.skin_mesh.v_p, v_invm=self.skin_mesh.v_invm,
             skin_idx_np=rc_skin_idx, init_target_np=rc_init_targets,
             dt=dt, alpha=1e0, pretension=1.0)   # weaker default
         self.xpbd.add_cons(self.ribcage_skin_springs)
@@ -380,14 +382,14 @@ class UnifiedTorso:
                 fascia_r_v_np, fascia_r_f, best_tri_r, best_uvw_r)
 
             self.breast_l_fascia_springs = KinematicSkinSpringConstraint(
-                v_p=self.mesh.v_p, v_invm=self.mesh.v_invm,
+                v_p=self.skin_mesh.v_p, v_invm=self.skin_mesh.v_invm,
                 skin_idx_np=self.base_l.astype(np.int32),
                 init_target_np=init_tgts_l,
                 dt=dt, alpha=1e-4, pretension=1.0)
             self.xpbd.add_cons(self.breast_l_fascia_springs)
 
             self.breast_r_fascia_springs = KinematicSkinSpringConstraint(
-                v_p=self.mesh.v_p, v_invm=self.mesh.v_invm,
+                v_p=self.skin_mesh.v_p, v_invm=self.skin_mesh.v_invm,
                 skin_idx_np=self.base_r.astype(np.int32),
                 init_target_np=init_tgts_r,
                 dt=dt, alpha=1e-4, pretension=1.0)
@@ -395,7 +397,7 @@ class UnifiedTorso:
 
         # ── 8. init rest status ───────────────────────────────────────────
         self.xpbd.init_rest_status()
-        print(f"[UnifiedTorso] {self.mesh.n_vert} verts, {self.mesh.n_tet} tets  "
+        print(f"[UnifiedTorso] {self.skin_mesh.n_vert} verts, {self.skin_mesh.n_tet} tets  "
               f"(L={self.n_left_tets} R={self.n_right_tets} S={self.n_skin_tets})  "
               f"bindings: {len(breast_b)} breast, "
               f"{len(self._kinematic_bindings)} kinematic, "
@@ -493,8 +495,9 @@ class UnifiedTorso:
     # ------------------------------------------------------------------
     def get_render_draws(self, breast_color=(0.85, 0.65, 0.55)):
         """Draw all breast+skin faces with per-pixel Phong normals."""
-        v_p  = self.mesh.v_p
-        f_i  = self.mesh.f_i
+        v_p  = self.skin_mesh.v_p
+        f_i  = self.skin_mesh.f_i
+
         def draw_all(scene):
             scene.mesh(v_p, f_i,
                        color=breast_color, show_wireframe=False, two_sided=False)
@@ -508,11 +511,11 @@ class UnifiedTorso:
         """
         if self.skin_f_i is None:
             return []
-        v_p     = self.mesh.v_p
+        v_p     = self.skin_mesh.v_p
         skin_fi = self.skin_f_i
         def draw_skin(scene):
             scene.mesh(v_p, skin_fi,
-                       color=color, two_sided=False, show_wireframe=True)
+                       color=color, two_sided=False, show_wireframe=False)
         return [draw_skin]
 
     def get_ligament_draws(self):
@@ -536,15 +539,15 @@ class UnifiedTorso:
     # Reset
     # ------------------------------------------------------------------
     def reset(self):
-        self.mesh.v_p.copy_from(self.mesh.v_p_ref)
-        self.mesh.reset_mass(rho=1.0)
+        self.skin_mesh.v_p.copy_from(self.skin_mesh.v_p_ref)
+        self.skin_mesh.reset_mass(rho=1.0)
         # Re-sync split tet-mass fields from the recomputed unified mass field.
-        _tm = self.mesh.t_mass.to_numpy()
+        _tm = self.skin_mesh.t_mass.to_numpy()
         n_bt = self.n_left_tets + self.n_right_tets
         self._breast_tm_field.from_numpy(_tm[:n_bt])
         if self.n_skin_tets > 0:
             self._skin_tm_field.from_numpy(_tm[n_bt:])
         # No hard pins (breast bases held by fascia springs).
-        self.mesh.set_fixed_point(0, self._pin_ti)
+        self.skin_mesh.set_fixed_point(0, self._pin_ti)
         self.xpbd.v_v.fill(0)
         self.xpbd.init_rest_status()

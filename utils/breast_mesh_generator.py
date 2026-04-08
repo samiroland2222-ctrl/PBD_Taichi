@@ -9,7 +9,7 @@ from PBD_Taichi.utils.gmsh_41_writer import write_msh41_single_block
 def generate_breast_msh(radius=0.07, height=0.06, k=0.7, k2=0.2,
                          axillary_extension=0.04,
                          axillary_height_fraction=0.2,
-                         target_tets=500, flange_depth=0.02, ribcage=None,
+                         target_tets=500, flange_depth=0.02, flange_radius_fraction=1.0, ribcage=None,
                         debug_save_path=None):
     """
     Generate an anatomical breast mesh via a single loft through N cross-section wires.
@@ -31,6 +31,7 @@ def generate_breast_msh(radius=0.07, height=0.06, k=0.7, k2=0.2,
                                       below this the extension blends smoothly to its maximum
     target_tets              : int    Approximate target tetrahedron count
     flange_depth             : float  Posterior depth into chest wall (m)
+    flange_radius_fraction   : float  Flange radius as a fraction of radius (1.0 = cylinndrical flange, >1 = flared/conical outwards)
     ribcage                  : mesh   Optional ribcage mesh for boolean subtraction
                                       (needs .vertices or .verts and .faces attributes)
 
@@ -61,10 +62,16 @@ def generate_breast_msh(radius=0.07, height=0.06, k=0.7, k2=0.2,
     R_base   = radius * (1.5 ** n)
 
     # Flange radius at z=-flange_depth: k2 governs both roll curvature and width
-    R_flange = R_base * (1.0 + k2 * 0.3)
+    R_flange = radius * flange_radius_fraction
 
     # Height below which axillary extension is blended in
     z_ax = axillary_height_fraction * height
+
+    # L (length scale for meshing) estimated from target tet count and rough breast volume:
+    mound_vol_est  = math.pi * R_base**2 * height / 3
+    flange_vol_est = math.pi * R_flange**2 * flange_depth
+    total_vol      = mound_vol_est + flange_vol_est
+    L = (total_vol / (target_tets * 0.117)) ** (1/3)
 
     # ------------------------------------------------------------------ #
     # Helper functions                                                     #
@@ -72,8 +79,9 @@ def generate_breast_msh(radius=0.07, height=0.06, k=0.7, k2=0.2,
     def profile_r(z):
         """Radius of the symmetric (circular) profile at height z."""
         if z >= 0.0:
-            t = max((height - z) / height, 0.0)   # 0 at apex, 1 at z=0
-            return R_base * (t ** n)
+            t = max((height - z) / height, L/3)   # 0 at apex, 1 at z=0
+            R_apex = L * num_ang / (6.0 * math.pi)
+            return R_apex + (R_base - R_apex) * (t ** n)
         else:
             t = -z / flange_depth                  # 0 at z=0, 1 at z=-flange_depth
             return R_base + (R_flange - R_base) * (t ** n2)
@@ -95,14 +103,14 @@ def generate_breast_msh(radius=0.07, height=0.06, k=0.7, k2=0.2,
     z_values = np.linspace(-flange_depth, height, num_z_sections)
 
     section_wires = []
-    for zi in z_values[:-2]:
+    for zi in z_values:
         ri    = profile_r(zi)
         assert ri > 0
         blend = ax_blend(zi)
 
         pt_tags = []
         for j in range(num_ang):
-            theta = -2.0 * math.pi * j / num_ang
+            theta = 2.0 * math.pi * j / num_ang
             cos_t = math.cos(theta)
             sin_t = math.sin(theta)
 
@@ -119,36 +127,12 @@ def generate_breast_msh(radius=0.07, height=0.06, k=0.7, k2=0.2,
         spline = occ.addSpline(pt_tags + [pt_tags[0]])
         section_wires.append(occ.addWire([spline]))
 
-    # Cone cap (z_values[-2] -> apex at z=height
-    apex_cone_base_z = z_values[-2]
-    apex_cone_base_r = profile_r(apex_cone_base_z)
-    assert apex_cone_base_r > 0
-
-    # circle section to fuse with cone base
-    assert ax_blend(z_values[-2]) == 0.0, (
-        "axillary_height_fraction is too large: the topmost loft "
-        "section still has axillary curvature; the cone-cap trick "
-        "requires a circular top section."
-    )
-    circle = occ.addCircle(0.0, 0.0, z_values[-2], profile_r(z_values[-2]))
-    section_wires.append(occ.addWire([circle]))
-
-    # cone
-    cone_tag = occ.addCone(0.0, 0.0, apex_cone_base_z,
-                           0.0, 0.0, height - apex_cone_base_z,
-                           apex_cone_base_r, 0.0)
-
-
     # ------------------------------------------------------------------ #
     # 2.  loft and fuse                        #
     # ------------------------------------------------------------------ #
     # Loft the body (posterior face -> z_values[2])
     loft_result     = occ.addThruSections(section_wires, makeSolid=True, makeRuled=False)
-    loft_vol = loft_result[0][1]
-
-    # fuse into one solid
-    fused, _ = occ.fuse([(3, loft_vol)], [(3, cone_tag)])
-    breast_vol = fused[0][1]
+    breast_vol = loft_result[0][1]
 
     # ------------------------------------------------------------------ #
     # 3.  OPTIONAL RIBCAGE BOOLEAN SUBTRACTION                            #
@@ -177,10 +161,6 @@ def generate_breast_msh(radius=0.07, height=0.06, k=0.7, k2=0.2,
     # ------------------------------------------------------------------ #
     # 4.  MESHING                                                         #
     # ------------------------------------------------------------------ #
-    mound_vol_est  = math.pi * R_base**2 * height / 3
-    flange_vol_est = math.pi * R_flange**2 * flange_depth
-    total_vol      = mound_vol_est + flange_vol_est
-    L = (total_vol / (target_tets * 0.117)) ** (1/3)
 
     f = gmsh.model.mesh.field.add("MathEval")
     gmsh.model.mesh.field.setString(f, "F",
