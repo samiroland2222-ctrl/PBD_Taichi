@@ -1,8 +1,39 @@
+import os
 import taichi as ti
 from pxr import Usd, UsdGeom
 from geom import gmesh
 import numpy as np
 import time
+
+# ---------------------------------------------------------------------------
+# Backend routing
+# ---------------------------------------------------------------------------
+# Select the rendering backend via:
+#   • environment variable:  RENDERER_BACKEND=wgpu
+#   • constructor argument:  TaichiRenderer3D(..., backend='wgpu')
+# The default remains the Taichi UI backend ('taichi').
+_ENV_BACKEND = os.environ.get("RENDERER_BACKEND", "taichi").lower()
+
+
+def _make_renderer(title, res, fps, cameraPos, cameraLookat,
+                   vertColor=False, backend=None):
+    """Factory that returns the appropriate renderer instance.
+
+    Parameters
+    ----------
+    backend : str | None
+        ``'wgpu'`` – use the pygfx/wgpu backend (``WgpuRenderer3D``).
+        ``'taichi'`` or ``None`` – use the Taichi UI backend (default).
+        If ``None`` the ``RENDERER_BACKEND`` environment variable is
+        consulted, falling back to ``'taichi'``.
+    """
+    chosen = (backend or _ENV_BACKEND).lower()
+    if chosen == "wgpu":
+        from utils.renderer_wgpu import WgpuRenderer3D
+        return WgpuRenderer3D(title, res, fps, cameraPos, cameraLookat,
+                              vertColor=vertColor)
+    # Taichi UI backend constructed inline (see TaichiRenderer3D below)
+    return None  # sentinel: caller builds Taichi renderer as normal
 
 
 class _SceneProxy:
@@ -35,13 +66,28 @@ class _SceneProxy:
 
 class TaichiRenderer3D:
 
+  def __new__(cls, title: str, res, fps, cameraPos, cameraLookat,
+              vertColor=False, backend=None):
+    """Return a WgpuRenderer3D when the wgpu backend is selected."""
+    chosen = (backend or _ENV_BACKEND).lower()
+    if chosen == "wgpu":
+      from utils.renderer_wgpu import WgpuRenderer3D
+      return WgpuRenderer3D(title, res, fps, cameraPos, cameraLookat,
+                            vertColor=vertColor)
+    return super().__new__(cls)
+
   def __init__(self,
                title: str,
                res,
                fps,
                cameraPos,
                cameraLookat,
-               vertColor=False) -> None:
+               vertColor=False,
+               backend=None) -> None:
+    # Skip Taichi UI initialisation when the wgpu backend was chosen
+    # (__new__ already returned a WgpuRenderer3D in that case).
+    if not isinstance(self, TaichiRenderer3D):
+      return
     self.window = ti.ui.Window(title, res)
     self.gui = self.window.get_gui()
     self.canvas = self.window.get_canvas()

@@ -133,7 +133,7 @@ class TrianMesh:
 
   def get_render_draw(self, color=(0.5, 0.5, 0.5), wireframe=False):
 
-    def render_draw(scene: ti.ui.Scene):
+    def render_draw(scene):
       scene.mesh(self.v_p, self.f_i, color=color, show_wireframe=wireframe)
 
     return render_draw

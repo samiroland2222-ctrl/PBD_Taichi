@@ -58,7 +58,7 @@ dt         = 1.0 / (fps * substep)
 ribcage_verts = ribcage_mesh.v_p.to_numpy()
 torso = UnifiedTorso(
     skel,
-    breast_height=0.12,
+    breast_height=0.04,
     breast_radius=0.06,
     breast_k=1.0,
     breast_spread=0.6,
