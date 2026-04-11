@@ -49,8 +49,41 @@ from rendercanvas.glfw import GlfwRenderCanvas  # glfw now loads via PYGLFW_LIBR
 try:
     from imgui_bundle import imgui, hello_imgui
     _IMGUI_AVAILABLE = True
+
+    # Rendercanvas key-name → imgui.Key mapping.
+    # Used for the imgui-window-focused keyboard path (see _init_imgui).
+    _IMGUI_KEY_MAP: dict = {
+        ' ':          imgui.Key.space,
+        'Enter':      imgui.Key.enter,
+        'Escape':     imgui.Key.escape,
+        'Backspace':  imgui.Key.backspace,
+        'Delete':     imgui.Key.delete,
+        'Tab':        getattr(imgui.Key, 'tab', None),
+        'ArrowUp':    imgui.Key.up_arrow,
+        'ArrowDown':  imgui.Key.down_arrow,
+        'ArrowLeft':  imgui.Key.left_arrow,
+        'ArrowRight': imgui.Key.right_arrow,
+        'Home':       imgui.Key.home,
+        'End':        imgui.Key.end,
+        'Insert':     imgui.Key.insert,
+        'PageUp':     imgui.Key.page_up,
+        'PageDown':   imgui.Key.page_down,
+        **{f'F{i}': getattr(imgui.Key, f'f{i}', None) for i in range(1, 25)},
+    }
+
+    def _to_imgui_key(key: str):
+        """Map a rendercanvas key-name string to an imgui.Key value, or None."""
+        # Single letter (rendercanvas emits lowercase)
+        if len(key) == 1 and key.isalpha():
+            return getattr(imgui.Key, key.lower(), None)
+        return _IMGUI_KEY_MAP.get(key)
+
 except ImportError:
     _IMGUI_AVAILABLE = False
+    _IMGUI_KEY_MAP: dict = {}
+
+    def _to_imgui_key(key: str):  # type: ignore[misc]
+        return None
 
 # ---------------------------------------------------------------------------
 # Small helpers
@@ -325,17 +358,34 @@ class WgpuRenderer3D:
         # Camera-change tracking (print on move, like Taichi renderer)
         self._cam_pos_prev = cam_pos.copy()
 
+        # ── WASD / Q / C fly-navigation ───────────────────────────────
+        # Keys currently held down (lowercase). Populated by the canvas
+        # key_down / key_up handlers below; consumed each frame inside
+        # _apply_keyboard_movement().
+        self._keys_down: set[str] = set()
+        self._move_speed: float = 1.0   # world-units per second
+
+        def _on_key_down(event):
+            k = event.get("key", "")
+            if k:
+                self._keys_down.add(k.lower())
+            # 'p' → print camera info (canvas-window focus path)
+            if k == "p":
+                self._print_camera()
+
+        def _on_key_up(event):
+            k = event.get("key", "")
+            if k:
+                self._keys_down.discard(k.lower())
+
+        self.canvas.add_event_handler(_on_key_down, "key_down")
+        self.canvas.add_event_handler(_on_key_up, "key_up")
+
         # ── imgui GUI panel ───────────────────────────────────────────
         self._imgui_initialized = False
         if _IMGUI_AVAILABLE:
             self._init_imgui(fps)
 
-        # 'p' key → print camera info
-        def _print_camera_info(event):
-            if event.get("key") == "p":
-                self._print_camera()
-
-        self.canvas.add_event_handler(_print_camera_info, "key_down")
 
     # ------------------------------------------------------------------ imgui
 
@@ -344,6 +394,30 @@ class WgpuRenderer3D:
         _gui = WgpuGui()
 
         def _imgui_frame() -> None:
+            # ── Keyboard shortcuts (hello_imgui-window focus path) ────────
+            # GLFW only fires key callbacks on the OS-focused window.
+            # After startup the hello_imgui window holds keyboard focus until
+            # the user clicks the 3-D viewport.  Check key presses via
+            # imgui's own IO so shortcuts fire regardless of which window
+            # happens to be focused.  The canvas.add_event_handler path
+            # covers the same shortcuts when the rendercanvas window is focused.
+            #
+            # NOTE: do NOT gate on io.want_capture_keyboard here.
+            # hello_imgui enables ImGuiConfigFlags_NavEnableKeyboard by default,
+            # which sets want_capture_keyboard=True even when no widget is
+            # editing text, silently blocking every shortcut.  Use
+            # imgui.is_any_item_active() instead – it is True only when a
+            # text-input (or similar) widget actually has keyboard focus.
+            if not imgui.is_any_item_active():
+                # 'p' → print camera info
+                if imgui.is_key_pressed(imgui.Key.p, False):
+                    self._print_camera()
+                # All add_click_event() registered shortcuts
+                for _ks, _fn in list(self.keyboard_input.items()):
+                    _ik = _to_imgui_key(_ks)
+                    if _ik is not None and imgui.is_key_pressed(_ik, False):
+                        _fn()
+
             # ── User GUI callbacks ────────────────────────────────────
             if self.gui_list:
                 imgui.set_next_window_pos(
@@ -388,6 +462,65 @@ class WgpuRenderer3D:
         print(f"Camera position : {pos}")
         print(f"Camera lookat   : {target}")
 
+    def _apply_keyboard_movement(self) -> None:
+        """Translate camera + orbit target with WASD / E / C each frame.
+
+        Key bindings
+        ------------
+        W / S   move forward / backward along the horizontal view direction
+        A / D   strafe left / right
+        E / Q   move up / down along world-Y
+        """
+        _NAV = {'w', 'a', 's', 'd', 'e', 'q'}
+
+        # --- collect active keys from both input sources ----------------
+        # Source 1: canvas key_down/key_up events (rendercanvas window focused)
+        active: set[str] = self._keys_down & _NAV
+
+        # Source 2: imgui.is_key_down() (imgui window focused)
+        if _IMGUI_AVAILABLE and self._imgui_initialized and not imgui.is_any_item_active():
+            for k in _NAV:
+                ik = _to_imgui_key(k)
+                if ik is not None and imgui.is_key_down(ik):
+                    active.add(k)
+
+        if not active:
+            return
+
+        speed = self._move_speed * self.frame_dt
+
+        cam_pos = np.array(self.camera.world.position, dtype=float)
+        target  = np.array(self.controller.target,     dtype=float)
+
+        # Forward = horizontal direction from camera toward target
+        fwd = target - cam_pos
+        fwd[1] = 0.0
+        fwd_len = np.linalg.norm(fwd)
+        if fwd_len > 1e-8:
+            fwd /= fwd_len
+
+        world_up = np.array([0.0, 1.0, 0.0], dtype=float)
+
+        # Right = cross(forward, world_up)
+        right = np.cross(fwd, world_up)
+        right_len = np.linalg.norm(right)
+        if right_len > 1e-8:
+            right /= right_len
+
+        delta = np.zeros(3, dtype=float)
+        if 'w' in active: delta += fwd      * speed
+        if 's' in active: delta -= fwd      * speed
+        if 'd' in active: delta += right    * speed
+        if 'a' in active: delta -= right    * speed
+        if 'e' in active: delta += world_up * speed
+        if 'q' in active: delta -= world_up * speed
+
+        if np.linalg.norm(delta) < 1e-10:
+            return
+
+        self.camera.local.position = cam_pos + delta
+        self.controller.target = (target + delta).tolist()
+
     # ------------------------------------------------------------------ draw
 
     def _draw_cb(self) -> None:
@@ -424,15 +557,12 @@ class WgpuRenderer3D:
     def render(self) -> None:
         """Pump events, render one frame (3-D + GUI), pace to target FPS."""
         # ── imgui event-capture guard ─────────────────────────────────
-        # Disable the OrbitController while Dear ImGui wants the mouse or
-        # keyboard (e.g. a slider is being dragged in the Controls panel).
-        # With a separate hello_imgui window this is always False, but the
-        # guard is correct and costs nothing; it will also work if/when the
-        # GUI is moved into the same window.
+        # Disable the OrbitController only while Dear ImGui has an active
+        # text-input widget (is_any_item_active).  Keyboard-navigation mode
+        # sets want_capture_keyboard=True even with no text field, so we
+        # must NOT use that flag here.
         if _IMGUI_AVAILABLE and self._imgui_initialized:
-            io = imgui.get_io()
-            self.controller.enabled = not (
-                io.want_capture_mouse or io.want_capture_keyboard)
+            self.controller.enabled = not imgui.is_any_item_active()
 
         # ── Camera-change detection ───────────────────────────────────
         new_pos = self.camera.world.position.copy()
@@ -447,6 +577,7 @@ class WgpuRenderer3D:
         # Calling only _rc_gui_poll() fills the queue but never empties it,
         # so the OrbitController (and all canvas event handlers) stay deaf.
         self.canvas._process_events()  # pump GLFW events AND flush to subscribers
+        self._apply_keyboard_movement() # translate camera for held WASD/E/C keys
         self.canvas.force_draw()        # draw + present
 
         # ── imgui GUI panel ───────────────────────────────────────────
