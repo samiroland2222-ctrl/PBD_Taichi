@@ -352,6 +352,10 @@ class WgpuRenderer3D:
         self.clip_x             = 0.0
         self._z_near_default    = 0.001
 
+        # Surface-normals overlay
+        self.show_surface_normals  = False
+        self.surface_normals_scale = 0.01
+
         # Persistent proxy (owns per-object pygfx caches)
         self._proxy = WgpuSceneProxy(self._scene)
 
@@ -429,12 +433,14 @@ class WgpuRenderer3D:
                     fn(_gui)
                 imgui.end()
 
-            # ── X-slice panel (always visible) ────────────────────────
+            # ── Overlays panel (X-slice + surface normals) ────────────────
             imgui.set_next_window_pos(
                 (0, 710), imgui.Cond_.first_use_ever)
             imgui.set_next_window_size(
-                (370, 130), imgui.Cond_.first_use_ever)
-            imgui.begin("X-Slice")
+                (370, 210), imgui.Cond_.first_use_ever)
+            imgui.begin("Overlays")
+
+            imgui.text("── X-Slice ──")
             _c, self.clip_plane_enabled = imgui.checkbox(
                 "Enable X-slice", self.clip_plane_enabled)
             if self.clip_plane_enabled:
@@ -443,6 +449,17 @@ class WgpuRenderer3D:
                 imgui.text(f"  near clip @ x = {self.clip_x:.3f} m")
             else:
                 imgui.text("  (disabled – near clip = default)")
+
+            imgui.separator()
+            imgui.text("── Surface Normals ──")
+            _c, self.show_surface_normals = imgui.checkbox(
+                "Show surface normals", self.show_surface_normals)
+            if self.show_surface_normals:
+                _c, self.surface_normals_scale = imgui.slider_float(
+                    "Normal scale", self.surface_normals_scale, 0.001, 0.1)
+            else:
+                imgui.text("  (disabled)")
+
             imgui.end()
 
         hello_imgui.manual_render.setup_from_gui_function(
@@ -547,6 +564,68 @@ class WgpuRenderer3D:
 
     def clear_scene_render_draw(self) -> None:
         self.scene_render_list.clear()
+
+    def make_normals_draw_callback(
+        self,
+        get_verts: Callable,
+        get_faces: Callable,
+        color=(1.0, 0.9, 0.0),
+    ) -> Callable:
+        """Return a scene-render draw function that overlays per-vertex surface normals.
+
+        Parameters
+        ----------
+        get_verts : () -> (N, 3) float32
+            Called each frame; returns current surface vertex positions.
+        get_faces : () -> (F, 3) int32
+            Returns the surface triangle face array (called once, on first draw).
+        color : (r, g, b)
+            Line colour for the normal arrows. Default: yellow.
+
+        Returns
+        -------
+        A scene-render draw function suitable for :meth:`add_scene_render_draw`.
+
+        Example
+        -------
+        ::
+            normals_draw = tirender.make_normals_draw_callback(
+                lambda: torso.skin_mesh.v_p.to_numpy().astype(np.float32),
+                lambda: skin_fi_np,
+            )
+            tirender.add_scene_render_draw(normals_draw)
+        """
+        from PBD_Taichi.utils.geom3d import vertex_normals_trimesh
+
+        # Lazily allocated on the first draw call so that the mesh size is known.
+        _state: dict = {'seg': None, 'indices': None}
+
+        def _draw(scene) -> None:
+            verts = get_verts()          # (N, 3) float32
+            N = len(verts)
+
+            # Allocate segment buffer once
+            if _state['seg'] is None:
+                _state['seg']     = np.empty((2 * N, 3), dtype=np.float32)
+                _state['indices'] = np.arange(2 * N, dtype=np.int32)
+
+            seg = _state['seg']
+
+            if self.show_surface_normals:
+                faces   = get_faces()    # (F, 3) int32
+                normals = vertex_normals_trimesh(
+                    verts.astype(np.float64), faces).astype(np.float32)
+                scale   = float(self.surface_normals_scale)
+                seg[0::2] = verts
+                seg[1::2] = verts + normals * scale
+            else:
+                # Degenerate (zero-length) segments are invisible
+                seg[0::2] = verts
+                seg[1::2] = verts
+
+            scene.lines(seg, 1.5, _state['indices'], color=color)
+
+        return _draw
 
     def add_scene_render_draw(self, scene_render_draw_call: Callable) -> None:
         self.scene_render_list.append(scene_render_draw_call)

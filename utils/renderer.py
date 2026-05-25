@@ -114,6 +114,12 @@ class TaichiRenderer3D:
     self.clip_x             = 0.0
     self._z_near_default    = 0.001   # metres – used when slice is off
 
+    # ── Surface-normals overlay ─────────────────────────────────────────
+    # Taichi UI has no efficient line-drawing for CPU arrays; the toggle
+    # is wired to the GUI but make_normals_draw_callback() returns a no-op.
+    self.show_surface_normals  = False
+    self.surface_normals_scale = 0.01
+
     def print_camera_info():
       print("Camera position: ", self.camera.curr_position)
       print("Camera look at: ", self.camera.curr_lookat)
@@ -167,7 +173,15 @@ class TaichiRenderer3D:
       if self.window.event.key in self.keyboard_input:
         self.keyboard_input[self.window.event.key]()
 
+  def make_normals_draw_callback(self, get_verts, get_faces):
+    """Stub: Taichi UI cannot efficiently draw CPU-side line arrays.
 
+    The wgpu backend (``WgpuRenderer3D``) provides a full implementation.
+    This version returns a no-op so call-sites work on both backends.
+    """
+    def _noop(scene):
+      pass
+    return _noop
 
   def render(self):
     old_cam_pos = self.camera.curr_position
@@ -196,8 +210,9 @@ class TaichiRenderer3D:
         for gui_draw in self.gui_list:
           gui_draw(self.gui)
 
-    # ── X-slice controls (always visible) ─────────────────────────────
-    with self.gui.sub_window('X-Slice', 0.0, 0.41, 0.3, 0.12):
+    # ── Overlays panel (X-slice + surface normals) ─────────────────────
+    with self.gui.sub_window('Overlays', 0.0, 0.41, 0.3, 0.20):
+      self.gui.text("── X-Slice ──")
       self.clip_plane_enabled = self.gui.checkbox(
           "Enable X-slice", self.clip_plane_enabled)
       if self.clip_plane_enabled:
@@ -206,6 +221,16 @@ class TaichiRenderer3D:
         self.gui.text(f"  near clip @ x = {self.clip_x:.3f} m")
       else:
         self.gui.text("  (disabled – near clip = default)")
+
+      self.gui.text("── Surface Normals ──")
+      self.show_surface_normals = self.gui.checkbox(
+          "Show surface normals", self.show_surface_normals)
+      if self.show_surface_normals:
+        self.surface_normals_scale = self.gui.slider_float(
+            "Normal scale", self.surface_normals_scale, 0.001, 0.1)
+        self.gui.text(f"  (not supported in Taichi UI backend)")
+      else:
+        self.gui.text("  (disabled)")
 
     self.window.show()
 

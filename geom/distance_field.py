@@ -183,28 +183,87 @@ def _remesh_surface(mesh: BasicTriMesh, target_edge_len: float) -> BasicTriMesh:
 
 def _vertex_normals(mesh: BasicTriMesh) -> np.ndarray:
     """Per-vertex outward normals: area-weighted average, unit-normalised."""
-    verts, faces = mesh.verts, mesh.faces
-    n = np.zeros_like(verts)
-    a = verts[faces[:, 0]]
-    b = verts[faces[:, 1]]
-    c = verts[faces[:, 2]]
-    fn = np.cross(b - a, c - a)        # 2×area-weighted face normals
-    np.add.at(n, faces[:, 0], fn)
-    np.add.at(n, faces[:, 1], fn)
-    np.add.at(n, faces[:, 2], fn)
-    norms = np.linalg.norm(n, axis=1, keepdims=True)
-    return np.where(norms > 0, n / norms, 0.0)
+    from PBD_Taichi.geom import geom3d
+    return geom3d.vertex_normals_trimesh(mesh.verts, mesh.faces)
 
 
-def _extrude_to_tets(mesh: BasicTriMesh, heights: list[float], debug_save_path: str | None=None) -> BasicTetMesh:
+def _project_normals_from_surface(
+    query_verts: np.ndarray,
+    source: BasicTriMesh,
+    k: int = 4,
+) -> np.ndarray:
+    """KDTree-based inverse-distance-weighted normal transfer.
+
+    For each vertex in *query_verts*, finds the ``k`` nearest vertices of
+    *source* and blends their normals weighted by 1/distance.  Falls back to
+    the closest normal when a query point coincides exactly with a source
+    vertex (distance == 0).
+
+    Parameters
+    ----------
+    query_verts : (Q, 3) float array
+        Positions whose normals are to be estimated.
+    source : BasicTriMesh
+        The reference surface that supplies smooth normals.
+    k : int
+        Number of nearest neighbours to blend (default 4).
+
+    Returns
+    -------
+    normals : (Q, 3) float array, unit length
+    """
+    from scipy.spatial import KDTree
+
+    src_normals = _vertex_normals(source)          # (S, 3)
+
+    tree = KDTree(source.verts)
+    dists, idxs = tree.query(query_verts, k=k)     # (Q, k) each
+
+    # Handle exact coincidences: replace zero distance with a large weight.
+    zero_mask = dists == 0.0
+    weights = np.where(zero_mask, 1e12, 1.0 / np.maximum(dists, 1e-30))  # (Q, k)
+
+    # When any neighbour is exactly coincident, zero-out all other weights.
+    has_exact = zero_mask.any(axis=1, keepdims=True)
+    weights = np.where(has_exact, np.where(zero_mask, weights, 0.0), weights)
+
+    weights /= weights.sum(axis=1, keepdims=True)  # normalise → sum to 1
+
+    blended = (weights[:, :, np.newaxis] * src_normals[idxs]).sum(axis=1)  # (Q, 3)
+
+    norms = np.linalg.norm(blended, axis=1, keepdims=True)
+    return np.where(norms > 0, blended / norms, 0.0)
+
+
+def _extrude_to_tets(
+    mesh: BasicTriMesh,
+    heights: list[float],
+    normals: np.ndarray | None = None,
+    debug_save_path: str | None = None,
+) -> BasicTetMesh:
     """Pure-numpy boundary layer extrusion along vertex normals.
 
     Vertex layout: [base, layer_0, layer_1, ..., layer_{N-1}]
     Each face × each layer → 1 prism → 3 tetrahedra.
     Exact output: ``3 · N · n_faces`` tets.
+
+    Parameters
+    ----------
+    mesh : BasicTriMesh
+        Surface mesh to extrude.
+    heights : list[float]
+        Cumulative extrusion heights for each layer.
+    normals : (N, 3) float array, optional
+        Per-vertex outward normals to use for extrusion.  When *None*, the
+        normals are computed from *mesh* itself via ``_vertex_normals``.
+        Pass pre-projected smooth normals here to avoid artefacts from
+        noisy marching-cubes geometry.
+    debug_save_path : str, optional
+        If provided, save the resulting tet mesh to this path.
     """
     verts, faces = mesh.verts, mesh.faces
-    normals = _vertex_normals(mesh)
+    if normals is None:
+        normals = _vertex_normals(mesh)
     n_v = len(verts)
 
     rings = [verts] + [verts + normals * h for h in heights]
@@ -332,49 +391,19 @@ def boolean_merge_meshes(meshes: list[BasicTriMesh], debug_save_path=None) -> Ba
         result_trimesh.save(debug_save_path)
     return result_trimesh
 
-
-
-def _stale____():
-
-    def _to_manifold(m: BasicTriMesh) -> manifold3d.Manifold:
-        swapped_faces = m.faces.copy()
-        # swap winding order
-        swapped_faces[:, 1] = m.faces[:, 0]
-        swapped_faces[:, 0] = m.faces[:, 1]
-        mesh = manifold3d.Mesh(
-            vert_properties=np.asarray(m.verts, dtype=np.float32),
-            tri_verts=swapped_faces,
-        )
-        return manifold3d.Manifold(mesh=mesh)
-
-    manifolds = [_to_manifold(m) for m in meshes[0:1]]
-
-    if len(manifolds) == 1:
-        result_manifold = manifolds[0]
-    else:
-        result_manifold = manifold3d.Manifold.batch_boolean(manifolds, manifold3d.OpType.Add)
-
-    out_mesh = result_manifold.to_mesh()
-    # vert_properties is (N, ≥3); first three columns are always XYZ
-    verts = np.asarray(out_mesh.vert_properties, dtype=np.float64)[:, :3]
-    faces = np.asarray(out_mesh.tri_verts, dtype=np.int32)
-
-    if debug_save_path:
-        import meshio
-        meshio.write_points_cells(
-            debug_save_path,
-            verts,
-            [("triangle", faces)],
-        )
-
-    return BasicTriMesh(verts=verts, faces=faces)
-
 def build_boundary_layer_sdf(
     surface_mesh: BasicTriMesh,
     layer_thickness: float,
     target_tet_count: int | None = None,
+    smooth_normals: bool = False,
     debug_save_path: str | None = None,
 ):
+    # Capture the original surface *before* the SDF/marching-cubes pipeline
+    # replaces surface_mesh.  When smooth_normals=True we will project normals
+    # from this smooth anatomy surface onto the (potentially noisy) remeshed
+    # marching-cubes skin so that the boundary layer follows clean anatomy
+    # normals rather than the rough MC geometry.
+    original_surface = surface_mesh
     # build a (SDF) signed distance field by voxelizing surface_mesh
     resolution = 0.005
     padding = layer_thickness + 20 * resolution  # ensure the iso-surface fits inside the grid
@@ -459,7 +488,12 @@ def build_boundary_layer_sdf(
     heights = [layer_thickness]
     e = _target_edge_len(surface_mesh, target_tet_count, n_layers=1)
     surface_mesh = _remesh_surface(surface_mesh, e)
-    return _extrude_to_tets(surface_mesh, heights, debug_save_path=debug_save_path)
+
+    extrude_normals = None
+    if smooth_normals:
+        extrude_normals = _project_normals_from_surface(surface_mesh.verts, original_surface)
+
+    return _extrude_to_tets(surface_mesh, heights, normals=extrude_normals, debug_save_path=debug_save_path)
 
 def build_boundary_layer(
     surface_mesh: BasicTriMesh,

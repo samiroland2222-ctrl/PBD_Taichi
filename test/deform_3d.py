@@ -103,6 +103,15 @@ for draw in torso.get_ligament_draws():
 for draw in torso.get_skin_anchor_draws():   # reddish bilateral breast-skin springs
     tirender.add_scene_render_draw(draw)
 
+# ── Surface-normal overlay (wgpu backend: yellow lines; Taichi backend: no-op) ─
+if torso.skin_f_i is not None:
+    _skin_fi_np = torso.skin_f_i.to_numpy().reshape(-1, 3)
+    _normals_draw = tirender.make_normals_draw_callback(
+        lambda: torso.skin_mesh.v_p.to_numpy().astype(np.float32),
+        lambda: _skin_fi_np,
+    )
+    tirender.add_scene_render_draw(_normals_draw)
+
 # ── GUI ───────────────────────────────────────────────────────────────────────
 log_b_hydro   = [math.log10(torso.deform_breast.hydro_alpha)]
 log_b_devia   = [math.log10(torso.deform_breast.devia_alpha)]

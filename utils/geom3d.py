@@ -1,6 +1,32 @@
 import numpy as np
 
 
+def vertex_normals_trimesh(verts: np.ndarray, faces: np.ndarray) -> np.ndarray:
+    """Per-vertex outward normals for a triangle mesh: area-weighted average, unit-normalised.
+
+    Parameters
+    ----------
+    verts : (N, 3) float array
+    faces : (F, 3) int array
+
+    Returns
+    -------
+    normals : (N, 3) float64, unit-length (zero-vector for isolated vertices).
+    """
+    verts = np.asarray(verts, dtype=np.float64)
+    faces = np.asarray(faces, dtype=np.int32)
+    n = np.zeros_like(verts, dtype=np.float64)
+    a = verts[faces[:, 0]]
+    b = verts[faces[:, 1]]
+    c = verts[faces[:, 2]]
+    fn = np.cross(b - a, c - a)        # 2×area-weighted face normals
+    np.add.at(n, faces[:, 0], fn)
+    np.add.at(n, faces[:, 1], fn)
+    np.add.at(n, faces[:, 2], fn)
+    norms = np.linalg.norm(n, axis=1, keepdims=True)
+    return np.where(norms > 0, n / norms, 0.0)
+
+
 def extract_surface_faces(vertex_pos: np.ndarray, tet_indices: np.ndarray):
   raw_tet_faces = []
   raw_tet_id = []

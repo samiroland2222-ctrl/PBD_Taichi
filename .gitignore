@@ -129,4 +129,4 @@ dmypy.json
 .pyre/
 outputs/2022-11-14
 
-track/
+.DS_Store
