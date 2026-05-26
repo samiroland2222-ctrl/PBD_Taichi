@@ -162,7 +162,8 @@ def generate_skin_shell(
         merged_surface,
         layer_thickness=thickness,
         target_tet_count=target_n_tets,
-        debug_save_path="generate_skin_shell_sdf.msh"
+        debug_save_path="generate_skin_shell_sdf.msh",
+        smooth_normals=True
     )
     n_v         = len(shell.verts) // 2   # N=1 → two equal rings
     inner_verts = shell.verts[:n_v]       # (n_v, 3) – on the merged-surface side

@@ -1,9 +1,9 @@
 import os
+import random
 
 import taichi as ti
 import numpy as np
 import math
-import random
 
 from cons import framework, deform3d, coopers, breast
 from cons.torso import UnifiedTorso
@@ -11,6 +11,13 @@ from geom import gtet, obj, anatomy, gmesh
 from utils import renderer, breast_mesh_generator, parser
 
 from PBD_Taichi.cons.torso import SKIN_HYDRO_ALPHA, SKIN_DEVIA_ALPHA
+
+# ── Skin PBR texture support (wgpu backend only) ──────────────────────────────
+try:
+    from utils.skin_texture_gen import generate_skin_textures as _gen_skin_tex
+    _SKIN_TEX_AVAILABLE = True
+except ImportError:
+    _SKIN_TEX_AVAILABLE = False
 
 ti.init(arch=ti.cpu, cpu_max_num_threads=1)
 
@@ -89,13 +96,69 @@ tirender = renderer.TaichiRenderer3D("Deform 3D – Unified Torso",
                                      cameraPos=(0.5, 0.15, 0.2),
                                      cameraLookat=(-0.4, -0.03, -0.17))
 
+# ── Detect wgpu backend and set up PBR skin ───────────────────────────────────
+_wgpu = hasattr(tirender, 'setup_skin_lighting')
+
+# PBR skin texture state (wgpu only)
+_skin_tex       = None   # SkinTextures instance (or None)
+_skin_tex_seed  = [42]   # mutable so the keybind closure can update it
+_pbr_skin_on    = [True] # GUI toggle — live switch between PBR and flat-color
+
+def _build_skin_textures(seed: int):
+    """Generate (or regenerate) skin PBR textures from the current skin mesh."""
+    if not (_SKIN_TEX_AVAILABLE and _wgpu and torso.skin_f_i is not None):
+        return None
+    verts_np = torso.skin_mesh.v_p.to_numpy()
+    faces_np = torso.skin_f_i.to_numpy().reshape(-1, 3)
+    if len(faces_np) == 0:
+        return None
+    print(f"[skin PBR] generating textures (seed={seed}, "
+          f"{len(verts_np)} verts, {len(faces_np)} faces) …")
+    return _gen_skin_tex(
+        verts_np, faces_np,
+        resolution=1024,
+        seed=seed,
+        freckle_density=0.55,
+        base_roughness=0.27,
+        dewy_intensity=0.13,
+        emissive_intensity=0.09,
+        normal_strength=0.60,
+        verbose=True,
+    )
+
+if _wgpu:
+    tirender.setup_skin_lighting()
+    _skin_tex = _build_skin_textures(_skin_tex_seed[0])
+
 skin_color = (0.85, 0.65, 0.55)
+
+# ── Scene render draws ────────────────────────────────────────────────────────
 tirender.add_scene_render_draw(skeleton_mesh.get_render_draw(color=(0.7, 0.7, 0.5), wireframe=False))
 tirender.add_scene_render_draw(ribcage_mesh.get_render_draw(color=(0.7, 0.7, 0.5), wireframe=False))
-for draw in torso.get_render_draws():
-    tirender.add_scene_render_draw(draw)
-#for draw in torso.get_skin_draws(color=(0.1, 1.0, 0.1)):          # raycast skin surface
-#    tirender.add_scene_render_draw(draw)
+
+if _wgpu and _skin_tex is not None:
+    # PBR skin draw: replaces the flat-color all-faces draw when PBR is active.
+    # Falls back to flat-color draw automatically if _pbr_skin_on[0] is False.
+    def _skin_pbr_draw(scene):
+        if _pbr_skin_on[0] and _skin_tex is not None:
+            scene.skin_mesh(torso.skin_mesh.v_p, _skin_tex)
+        else:
+            scene.mesh(torso.skin_mesh.v_p, torso.skin_f_i,
+                       color=skin_color, show_wireframe=False, two_sided=False)
+    tirender.add_scene_render_draw(_skin_pbr_draw)
+
+    # Breast interior (non-skin all-faces draw) shown when PBR is OFF only,
+    # so the inner structure is accessible via the x-slice toggle in PBR mode.
+    def _breast_flat_draw(scene):
+        if not _pbr_skin_on[0]:
+            scene.mesh(torso.skin_mesh.v_p, torso.skin_mesh.f_i,
+                       color=skin_color, show_wireframe=False, two_sided=False)
+    tirender.add_scene_render_draw(_breast_flat_draw)
+else:
+    # Taichi backend or texture generation failed → existing flat-color draw
+    for draw in torso.get_render_draws():
+        tirender.add_scene_render_draw(draw)
+
 for draw in skel.get_render_draws():
     tirender.add_scene_render_draw(draw)
 for draw in torso.get_ligament_draws():
@@ -113,6 +176,9 @@ if torso.skin_f_i is not None:
     tirender.add_scene_render_draw(_normals_draw)
 
 # ── GUI ───────────────────────────────────────────────────────────────────────
+# PBR knobs (wgpu only) — adjusted live via the material properties
+_emissive_intensity = [0.09]
+_normal_strength    = [0.60]
 log_b_hydro   = [math.log10(torso.deform_breast.hydro_alpha)]
 log_b_devia   = [math.log10(torso.deform_breast.devia_alpha)]
 log_s_hydro   = [math.log10(torso.deform_skin.hydro_alpha)]  if torso.deform_skin else [math.log10(SKIN_HYDRO_ALPHA)]
@@ -185,6 +251,21 @@ def gui_draw(gui):
     skel.arm_right_flexion   = gui.slider_float("R flex", skel.arm_right_flexion, -1.0, 2.5)
     skel.arm_right_abduction = gui.slider_float("R abd", skel.arm_right_abduction, -0.3, 2.5)
 
+    # ── PBR Skin (wgpu only) ──────────────────────────────────────────────────
+    if _wgpu and _skin_tex is not None:
+        gui.text("-- PBR Skin --")
+        _pbr_skin_on[0] = gui.checkbox("PBR skin on", _pbr_skin_on[0])
+        if _pbr_skin_on[0]:
+            _emissive_intensity[0] = gui.slider_float(
+                "SSS emissive", _emissive_intensity[0], 0.0, 0.5)
+            _normal_strength[0] = gui.slider_float(
+                "Normal strength", _normal_strength[0], 0.0, 2.0)
+            # Apply to the live material immediately
+            _skin_tex.material.emissive_intensity = _emissive_intensity[0]
+            ns = _normal_strength[0] * 0.6
+            _skin_tex.material.normal_scale = (ns, ns)
+            gui.text("  Press T to regenerate textures (new seed)")
+
 tirender.add_gui_draw(gui_draw)
 
 # ── Simulation control ────────────────────────────────────────────────────────
@@ -208,6 +289,17 @@ def gui_draw_debug(gui):
     gui.text(f"  frame={sim['frame']}  {status}")
 
 tirender.add_gui_draw(gui_draw_debug)
+
+# ── Keybind: T → regenerate skin textures with new seed ──────────────────────
+if _wgpu and _SKIN_TEX_AVAILABLE:
+    def _regen_skin_textures():
+        global _skin_tex
+        _skin_tex_seed[0] = random.randint(0, 9999)
+        _skin_tex = _build_skin_textures(_skin_tex_seed[0])
+        if _skin_tex is not None:
+            _skin_tex.material.emissive_intensity = _emissive_intensity[0]
+        print(f"[skin PBR] regenerated (seed={_skin_tex_seed[0]})")
+    tirender.add_click_event('t', _regen_skin_textures)
 
 # ── Main loop ─────────────────────────────────────────────────────────────────
 import time as _time

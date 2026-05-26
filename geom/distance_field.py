@@ -187,12 +187,188 @@ def _vertex_normals(mesh: BasicTriMesh) -> np.ndarray:
     return geom3d.vertex_normals_trimesh(mesh.verts, mesh.faces)
 
 
+def _bary_interp_normals(
+    query_pts: np.ndarray,    # (Q, 3)
+    ref_verts: np.ndarray,    # (V, 3)
+    ref_faces: np.ndarray,    # (F, 3) int
+    ref_vnorms: np.ndarray,   # (V, 3) unit normals
+    k_faces: int = 8,
+) -> np.ndarray:
+    """Smooth normals for each query point by projecting onto the nearest
+    reference triangles and blending vertex normals at the closest point.
+
+    For each query point:
+      1. Find ``k_faces`` nearest face centroids via KDTree.
+      2. Compute exact closest point on each candidate triangle (Ericson
+         algorithm, fully vectorised over (Q, K)).
+      3. Pick the closest triangle, compute barycentric coordinates, and
+         interpolate the three face-vertex normals.
+
+    Returns unit normals, shape (Q, 3).
+    """
+    from scipy.spatial import KDTree
+
+    centroids = (ref_verts[ref_faces[:, 0]] +
+                 ref_verts[ref_faces[:, 1]] +
+                 ref_verts[ref_faces[:, 2]]) / 3.0          # (F, 3)
+    k_eff = min(k_faces, len(centroids))
+    tree = KDTree(centroids)
+    _, near_fi = tree.query(query_pts, k=k_eff)             # (Q,) or (Q, k)
+    if near_fi.ndim == 1:
+        near_fi = near_fi[:, np.newaxis]
+
+    Q, K = near_fi.shape
+
+    a_idx = ref_faces[near_fi, 0]                           # (Q, K)
+    b_idx = ref_faces[near_fi, 1]
+    c_idx = ref_faces[near_fi, 2]
+
+    A = ref_verts[a_idx]                                    # (Q, K, 3)
+    B = ref_verts[b_idx]
+    C = ref_verts[c_idx]
+    P = query_pts[:, np.newaxis, :]                         # (Q, 1, 3) → broadcasts
+
+    # ── Ericson closest-point-on-triangle (vectorised) ────────────────────────
+    AB = B - A;  AC = C - A
+    AP = P - A;  BP = P - B;  CP = P - C
+
+    d1 = (AB * AP).sum(-1);  d2 = (AC * AP).sum(-1)
+    d3 = (AB * BP).sum(-1);  d4 = (AC * BP).sum(-1)
+    d5 = (AB * CP).sum(-1);  d6 = (AC * CP).sum(-1)
+
+    va = d3 * d6 - d5 * d4
+    vb = d5 * d2 - d1 * d6
+    vc = d1 * d4 - d3 * d2
+
+    # Barycentric coords (u, v, w) → closest = u·A + v·B + w·C
+    u = np.ones((Q, K), dtype=np.float64)
+    v = np.zeros((Q, K), dtype=np.float64)
+    w = np.zeros((Q, K), dtype=np.float64)
+
+    # Vertex A region
+    m_a = (d1 <= 0) & (d2 <= 0)
+
+    # Vertex B region
+    m_b = (~m_a) & (d3 >= 0) & (d4 <= d3)
+    u[m_b] = 0.0;  v[m_b] = 1.0
+
+    # Vertex C region
+    m_c = (~m_a) & (~m_b) & (d6 >= 0) & (d5 <= d6)
+    u[m_c] = 0.0;  w[m_c] = 1.0
+
+    # Edge AB  (vc ≤ 0, d1 ≥ 0, d3 ≤ 0)
+    m_ab = (~m_a) & (~m_b) & (~m_c) & (vc <= 0) & (d1 >= 0) & (d3 <= 0)
+    den_ab = d1 - d3
+    t_ab = np.where(np.abs(den_ab) > 1e-30, d1 / den_ab, 0.5)
+    u[m_ab] = 1.0 - t_ab[m_ab];  v[m_ab] = t_ab[m_ab];  w[m_ab] = 0.0
+
+    # Edge AC  (vb ≤ 0, d2 ≥ 0, d6 ≤ 0)
+    m_ac = (~m_a) & (~m_b) & (~m_c) & (~m_ab) & (vb <= 0) & (d2 >= 0) & (d6 <= 0)
+    den_ac = d2 - d6
+    t_ac = np.where(np.abs(den_ac) > 1e-30, d2 / den_ac, 0.5)
+    u[m_ac] = 1.0 - t_ac[m_ac];  v[m_ac] = 0.0;  w[m_ac] = t_ac[m_ac]
+
+    # Edge BC  (va ≤ 0, d4−d3 ≥ 0, d5−d6 ≥ 0)
+    d43 = d4 - d3;  d56 = d5 - d6
+    m_bc = (~m_a) & (~m_b) & (~m_c) & (~m_ab) & (~m_ac) & (va <= 0) & (d43 >= 0) & (d56 >= 0)
+    den_bc = d43 + d56
+    t_bc = np.where(np.abs(den_bc) > 1e-30, d43 / den_bc, 0.5)
+    u[m_bc] = 0.0;  v[m_bc] = 1.0 - t_bc[m_bc];  w[m_bc] = t_bc[m_bc]
+
+    # Interior
+    m_int = (~m_a) & (~m_b) & (~m_c) & (~m_ab) & (~m_ac) & (~m_bc)
+    den_int = va + vb + vc
+    safe = np.abs(den_int) > 1e-30
+    v_int = np.where(safe, vb / den_int, 1.0 / 3.0)
+    w_int = np.where(safe, vc / den_int, 1.0 / 3.0)
+    v[m_int] = v_int[m_int]
+    w[m_int] = w_int[m_int]
+    u[m_int] = np.clip(1.0 - v[m_int] - w[m_int], 0.0, 1.0)
+
+    # ── Pick the closest triangle per query ───────────────────────────────────
+    closest = (A * u[:, :, np.newaxis] +
+               B * v[:, :, np.newaxis] +
+               C * w[:, :, np.newaxis])                     # (Q, K, 3)
+    sq_dists = ((closest - P) ** 2).sum(-1)                 # (Q, K)
+    best_k = np.argmin(sq_dists, axis=1)                    # (Q,)
+    qi = np.arange(Q)
+    u_b = u[qi, best_k];  v_b = v[qi, best_k];  w_b = w[qi, best_k]
+    ai  = a_idx[qi, best_k]
+    bi  = b_idx[qi, best_k]
+    ci  = c_idx[qi, best_k]
+
+    # ── Barycentric normal interpolation ─────────────────────────────────────
+    n_interp = (ref_vnorms[ai] * u_b[:, np.newaxis] +
+                ref_vnorms[bi] * v_b[:, np.newaxis] +
+                ref_vnorms[ci] * w_b[:, np.newaxis])        # (Q, 3)
+    norms = np.linalg.norm(n_interp, axis=1, keepdims=True)
+    return np.where(norms > 1e-12, n_interp / norms, ref_vnorms[ai])
+
+
+def _smooth_skin_to_reference(
+    skin: BasicTriMesh,
+    reference: BasicTriMesh,
+    iterations: int = 10,
+    step: float = 0.5,
+) -> BasicTriMesh:
+    """Remove voxel-grid staircase artefacts from a marching-cubes mesh using
+    tangential Laplacian smoothing guided by smooth normals from ``reference``.
+
+    Each iteration:
+      1. For every skin vertex find its smooth target normal by projecting onto
+         the nearest face in ``reference`` and barycentric-interpolating the
+         reference vertex normals (see ``_bary_interp_normals``).
+      2. Compute the Laplacian displacement (ring-mean − vertex).
+      3. Remove the component along the smooth normal (project onto the
+         tangent plane) so movement stays *on* the surface.
+      4. Apply ``step × tangential_laplacian`` to each vertex.
+
+    Because movement is restricted to the tangent plane, the surface does not
+    shrink and the overall shape defined by ``reference`` is preserved.
+    """
+    ref_vnorms = _vertex_normals(reference)
+
+    # ── Build directed edge table for vectorised Laplacian ────────────────────
+    edges: set[tuple[int, int]] = set()
+    for f in skin.faces:
+        a, b, c = int(f[0]), int(f[1]), int(f[2])
+        edges.update(((a, b), (b, a), (b, c), (c, b), (a, c), (c, a)))
+    src = np.array([e[0] for e in edges], dtype=np.int32)
+    dst = np.array([e[1] for e in edges], dtype=np.int32)
+    n_v = len(skin.verts)
+    # Degree of each vertex (number of ring neighbours)
+    deg = np.bincount(src, minlength=n_v).astype(np.float64)  # (V,)
+    deg_safe = np.maximum(deg, 1.0)[:, np.newaxis]            # (V, 1)
+
+    verts = skin.verts.copy()
+
+    for _ in range(iterations):
+        # Smooth target normal at each current vertex position
+        target_n = _bary_interp_normals(
+            verts, reference.verts, reference.faces, ref_vnorms
+        )                                                     # (V, 3)
+
+        # Vectorised Laplacian: mean of ring neighbours − vertex
+        nbr_sum = np.zeros_like(verts)
+        np.add.at(nbr_sum, src, verts[dst])
+        lap = nbr_sum / deg_safe - verts                      # (V, 3)
+
+        # Project out normal component → tangential displacement only
+        dot = (lap * target_n).sum(axis=1, keepdims=True)    # (V, 1)
+        lap_t = lap - dot * target_n                          # (V, 3)
+
+        verts = verts + step * lap_t
+
+    return BasicTriMesh(verts=verts, faces=skin.faces.copy())
+
+
 def _project_normals_from_surface(
     query_verts: np.ndarray,
     source: BasicTriMesh,
     k: int = 4,
+    use_kdtree: bool = False,
 ) -> np.ndarray:
-    """KDTree-based inverse-distance-weighted normal transfer.
+    """KDTree-based (or brute-force) inverse-distance-weighted normal transfer.
 
     For each vertex in *query_verts*, finds the ``k`` nearest vertices of
     *source* and blends their normals weighted by 1/distance.  Falls back to
@@ -207,17 +383,30 @@ def _project_normals_from_surface(
         The reference surface that supplies smooth normals.
     k : int
         Number of nearest neighbours to blend (default 4).
-
-    Returns
-    -------
-    normals : (Q, 3) float array, unit length
+    use_kdtree : bool
+        Use scipy cKDTree (default False).  When False (default) a pure-numpy
+        brute-force cdist search is used instead — slower for large meshes but
+        immune to cKDTree SIGSEGV on degenerate/small point clouds.
+        Set to True only once the KDTree crash is resolved.
     """
-    from scipy.spatial import KDTree
-
     src_normals = _vertex_normals(source)          # (S, 3)
 
-    tree = KDTree(source.verts)
-    dists, idxs = tree.query(query_verts, k=k)     # (Q, k) each
+    _v  = np.ascontiguousarray(source.verts,  dtype=np.float64)
+    _qv = np.ascontiguousarray(query_verts,   dtype=np.float64)
+
+    if use_kdtree:
+        from scipy.spatial import KDTree
+        tree = KDTree(_v, leafsize=max(10, len(_v) // 10))
+        dists, idxs = tree.query(_qv, k=k)
+    else:
+        # Brute-force: O(S·Q) but only ~1 M ops for typical mesh sizes here.
+        # cdist returns (Q, S); argpartition gives the k smallest per row.
+        from scipy.spatial.distance import cdist
+        D     = cdist(_qv, _v)                                      # (Q, S)
+        part  = np.argpartition(D, k, axis=1)[:, :k]               # (Q, k) – unordered
+        idxs  = part[np.arange(len(_qv))[:, None],
+                     np.argsort(D[np.arange(len(_qv))[:, None], part], axis=1)]
+        dists = D[np.arange(len(_qv))[:, None], idxs]              # (Q, k) – sorted
 
     # Handle exact coincidences: replace zero distance with a large weight.
     zero_mask = dists == 0.0
@@ -399,11 +588,12 @@ def build_boundary_layer_sdf(
     debug_save_path: str | None = None,
 ):
     # Capture the original surface *before* the SDF/marching-cubes pipeline
-    # replaces surface_mesh.  When smooth_normals=True we will project normals
-    # from this smooth anatomy surface onto the (potentially noisy) remeshed
-    # marching-cubes skin so that the boundary layer follows clean anatomy
-    # normals rather than the rough MC geometry.
-    original_surface = surface_mesh
+    # replaces surface_mesh.  Force an owned copy so that the arrays survive
+    # any meshlib GC that may have occurred before smooth_normals is used.
+    original_surface = BasicTriMesh(
+        verts=np.array(surface_mesh.verts, dtype=np.float64, order='C'),
+        faces=np.array(surface_mesh.faces, dtype=np.int32,   order='C'),
+    )
     # build a (SDF) signed distance field by voxelizing surface_mesh
     resolution = 0.005
     padding = layer_thickness + 20 * resolution  # ensure the iso-surface fits inside the grid
@@ -454,8 +644,10 @@ def build_boundary_layer_sdf(
     mc_params.origin = origin    # must match the SDF grid origin
 
     skin_ml = mrmeshpy.marchingCubes(sdf_volume, mc_params)
-    skin_verts = mrmeshnumpy.getNumpyVerts(skin_ml)
-    skin_faces = mrmeshnumpy.getNumpyFaces(skin_ml.topology)
+    # getNumpyVerts/getNumpyFaces return non-owning views; copy immediately
+    # before skin_ml can be GC'd or mutated.
+    skin_verts = np.array(mrmeshnumpy.getNumpyVerts(skin_ml), dtype=np.float64, order='C')
+    skin_faces = np.array(mrmeshnumpy.getNumpyFaces(skin_ml.topology), dtype=np.int32, order='C')
 
     # The Gaussian blur blends SDF values with implicit zeros outside the grid
     # boundary, which can push edge-voxel values through zero and create a
@@ -481,6 +673,20 @@ def build_boundary_layer_sdf(
         skin_faces = remap[skin_faces]
 
     surface_mesh = BasicTriMesh(verts=skin_verts, faces=skin_faces)
+
+    # ── Smooth the marching-cubes surface before remeshing ────────────────────
+    # The iso-surface recovered from a voxel SDF inherits the grid structure,
+    # producing a lumpy/staircase outer surface even after Gaussian-smoothing
+    # the SDF.  Tangential Laplacian smoothing guided by smooth normals from
+    # the original surface removes these artefacts *before* remeshing, so the
+    # subsequent isotropic remesh operates on a clean, smooth input.
+    if smooth_normals:
+        surface_mesh = _smooth_skin_to_reference(
+            surface_mesh, original_surface,
+            iterations=10,
+            step=0.5,
+        )
+
     if debug_save_path:
         surface_mesh.save(debug_save_path + ".surface.ply")
 
@@ -489,9 +695,17 @@ def build_boundary_layer_sdf(
     e = _target_edge_len(surface_mesh, target_tet_count, n_layers=1)
     surface_mesh = _remesh_surface(surface_mesh, e)
 
+    # Also use smooth normals for the extrusion direction so the outer shell
+    # of the tet layer reflects the true surface curvature rather than the
+    # marching-cubes reconstruction.
     extrude_normals = None
     if smooth_normals:
-        extrude_normals = _project_normals_from_surface(surface_mesh.verts, original_surface)
+        extrude_normals = _bary_interp_normals(
+            surface_mesh.verts,
+            original_surface.verts,
+            original_surface.faces,
+            _vertex_normals(original_surface),
+        )
 
     return _extrude_to_tets(surface_mesh, heights, normals=extrude_normals, debug_save_path=debug_save_path)
 

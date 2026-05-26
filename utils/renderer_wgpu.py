@@ -107,6 +107,28 @@ def _rgba(c) -> tuple:
     if len(c) == 3:
         return (float(c[0]), float(c[1]), float(c[2]), 1.0)
     return tuple(float(x) for x in c)
+
+
+def _normals_from_verts(
+    verts: np.ndarray,   # (V, 3) float32
+    faces: np.ndarray,   # (F, 3) int32
+) -> np.ndarray:
+    """Fast area-weighted per-vertex normals, unit-normalised.  Returns float32."""
+    nv = len(verts)
+    v0 = verts[faces[:, 0]].astype(np.float64)
+    v1 = verts[faces[:, 1]].astype(np.float64)
+    v2 = verts[faces[:, 2]].astype(np.float64)
+    fn = np.cross(v1 - v0, v2 - v0)
+    nrm = np.zeros((nv, 3), np.float64)
+    np.add.at(nrm, faces[:, 0], fn)
+    np.add.at(nrm, faces[:, 1], fn)
+    np.add.at(nrm, faces[:, 2], fn)
+    n = np.linalg.norm(nrm, axis=1, keepdims=True)
+    return np.ascontiguousarray(
+        np.where(n > 1e-12, nrm / n, nrm).astype(np.float32)
+    )
+
+
 # ---------------------------------------------------------------------------
 # WgpuSceneProxy
 # ---------------------------------------------------------------------------
@@ -125,6 +147,8 @@ class WgpuSceneProxy:
         self._lines: dict = {}
         # id(taichi_field) -> (pts_obj, geometry, has_vertex_color)
         self._points: dict = {}
+        # id(taichi_field) -> (mesh_obj, geometry, vmapping)  — PBR skin meshes
+        self._skin_meshes: dict = {}
     # ------------------------------------------------------------------ mesh
     def mesh(self, vertices, indices, color=(0.5, 0.5, 0.5),
              show_wireframe=False, two_sided=False, **kwargs):
@@ -149,6 +173,56 @@ class WgpuSceneProxy:
             _obj, geo = self._meshes[key]
             geo.positions.data[:] = verts_np
             geo.positions.update_range()
+
+    # ------------------------------------------------------------ skin_mesh
+    def skin_mesh(self, vertices, skin_tex, recompute_normals: bool = True, **kwargs):
+        """Draw a PBR skin mesh with pre-generated textures from skin_tex.
+
+        Parameters
+        ----------
+        vertices : (V_orig, 3) numpy array or Taichi field
+            Original mesh vertex positions — updated every frame.
+        skin_tex : SkinTextures
+            Result of ``generate_skin_textures()``.  Contains the UV atlas,
+            remapped indices, pygfx textures, and the pre-wired
+            MeshStandardMaterial.
+        recompute_normals : bool
+            Recompute per-vertex normals from the deformed positions each frame.
+            Recommended for deformable meshes; set False for rigid bodies.
+        """
+        verts_np = _to_np_verts(vertices)   # (V_orig, 3) float32
+        key = id(vertices)
+
+        if key not in self._skin_meshes:
+            # ── First call: build pygfx Geometry ──────────────────────────
+            vmapping = skin_tex.vmapping    # (V_new,) int32
+            idx_new  = skin_tex.indices     # (F, 3) int32
+            uvs      = skin_tex.uvs         # (V_new, 2) float32
+
+            v_rem   = np.ascontiguousarray(verts_np[vmapping])   # (V_new, 3)
+            normals = _normals_from_verts(v_rem, idx_new)         # (V_new, 3)
+
+            geo = pygfx.Geometry(
+                positions=v_rem,
+                normals=normals,
+                texcoords=np.ascontiguousarray(uvs),
+                indices=np.ascontiguousarray(idx_new),
+            )
+            obj = pygfx.Mesh(geo, skin_tex.material)
+            self._scene.add(obj)
+            self._skin_meshes[key] = (obj, geo, vmapping)
+
+        else:
+            # ── Subsequent frames: update positions (+ optional normals) ───
+            _obj, geo, vmapping = self._skin_meshes[key]
+            v_rem = np.ascontiguousarray(verts_np[vmapping])
+            geo.positions.data[:] = v_rem
+            geo.positions.update_range()
+            if recompute_normals:
+                normals = _normals_from_verts(v_rem, geo.indices.data)
+                geo.normals.data[:] = normals
+                geo.normals.update_range()
+
     # ----------------------------------------------------------------- lines
     def lines(self, vertices, width, indices, color=(0.5, 0.5, 0.5), **kwargs):
         """Draw indexed line segments.
@@ -389,6 +463,47 @@ class WgpuRenderer3D:
         self._imgui_initialized = False
         if _IMGUI_AVAILABLE:
             self._init_imgui(fps)
+
+    # ---------------------------------------------------------------- skin lighting
+
+    def setup_skin_lighting(self) -> None:
+        """Replace the default single point-light with a rig tuned for skin.
+
+        Adds:
+          - Key light   : warm white, intensity 1.2, upper-left-front
+          - Fill light  : cool neutral, intensity 0.3, right-back
+          - Rim/back    : warm, intensity 0.45, upper-right-back
+          - Ambient     : soft neutral, intensity 0.25
+
+        Call once after construction, before the render loop.
+        """
+        # Remove the default point light
+        self._scene.remove(self._point_light)
+
+        # Ambient (replaces the existing one)
+        self._scene.remove(self._scene.children[0])   # existing AmbientLight
+        self._scene.add(pygfx.AmbientLight(color=(0.60, 0.63, 0.70), intensity=0.25))
+
+        # Key light — warm white, upper-left-front — follows camera
+        key = pygfx.DirectionalLight(color=(0.99, 0.95, 0.88), intensity=1.20)
+        key.local.position = np.array([-0.6, 1.2, 1.0])
+        key.look_at((0.0, 0.0, 0.0))
+        self._scene.add(key)
+
+        # Fill light — cool, right-back
+        fill = pygfx.DirectionalLight(color=(0.60, 0.65, 0.72), intensity=0.30)
+        fill.local.position = np.array([1.0, 0.3, -0.8])
+        fill.look_at((0.0, 0.0, 0.0))
+        self._scene.add(fill)
+
+        # Rim/back — warm, catches SSS emissive
+        rim = pygfx.DirectionalLight(color=(1.0, 0.88, 0.72), intensity=0.45)
+        rim.local.position = np.array([0.8, 0.8, -1.2])
+        rim.look_at((0.0, 0.0, 0.0))
+        self._scene.add(rim)
+
+        self._skin_lights = [key, fill, rim]
+
 
 
     # ------------------------------------------------------------------ imgui
