@@ -114,17 +114,22 @@ def _build_skin_textures(seed: int):
         return None
     print(f"[skin PBR] generating textures (seed={seed}, "
           f"{len(verts_np)} verts, {len(faces_np)} faces) …")
-    return _gen_skin_tex(
+    tex = _gen_skin_tex(
         verts_np, faces_np,
-        resolution=1024,
+        resolution=4096,
         seed=seed,
-        freckle_density=0.55,
-        base_roughness=0.27,
-        dewy_intensity=0.13,
-        emissive_intensity=0.09,
-        normal_strength=0.60,
+        # pore_cell_size=0 → auto-scales to 1/180 of bbox diagonal (fine micro-texture)
+        freckle_density=0.40,
+        base_roughness=0.55,   # was 0.27 — prevented plastic-like shininess
+        dewy_intensity=0.10,
+        emissive_intensity=0.08,
+        normal_strength=0.35,  # subtle bumps for smooth dewy skin
         verbose=True,
+        debug_save_dir="/tmp/skin_debug",   # saves atlas PNGs + mesh-overlay PNGs
     )
+    if tex is not None:
+        tex.save_with_overlay("/tmp/skin_debug", prefix="skin")
+    return tex
 
 if _wgpu:
     tirender.setup_skin_lighting()
