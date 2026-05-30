@@ -169,7 +169,29 @@ class UnifiedTorso:
         if self.skin_shell:
             skin_v_np   = self.skin_shell.verts.astype(np.float32)
             skin_t_np   = self.skin_shell.tets.flatten().astype(np.int32)
-            skin_f_surf = self.skin_shell.surface_faces()           # (F, 3) local
+            skin_f_surf_all = self.skin_shell.surface_faces()       # (F, 3) local — ALL faces
+
+            # ── Keep only the OUTER ring surface faces for rendering ──────────
+            # The extrusion layout is: verts[0 : n_v] = inner ring (anatomy-facing,
+            # normals pointing INWARD), verts[n_v : 2*n_v] = outer ring (skin-facing,
+            # normals pointing OUTWARD).  Including inner-ring faces in the rendered
+            # mesh produces dark/incorrectly-lit patches alongside properly-lit outer
+            # faces, making the surface appear lumpy.  Only outer-ring faces (all
+            # three vertex indices ≥ n_v) should be rendered.
+            n_v_half = len(skin_v_np) // 2   # inner ring: [0, n_v_half); outer: [n_v_half, …)
+            outer_mask = np.all(skin_f_surf_all >= n_v_half, axis=1)
+            skin_f_surf_outer = skin_f_surf_all[outer_mask]
+            if len(skin_f_surf_outer) == 0:
+                # Fallback (should not happen for well-formed shell)
+                print("[torso] Warning: no outer skin surface faces found; "
+                      "using all surface faces")
+                skin_f_surf_outer = skin_f_surf_all
+            print(f"[torso] skin surface: {len(skin_f_surf_all)} total → "
+                  f"{len(skin_f_surf_outer)} outer-ring faces kept for rendering")
+
+            # Merge uses ALL surface faces (for internal TetMesh f field),
+            # but skin_f_i stores only OUTER faces (for rendering + UV atlas).
+            skin_f_surf = skin_f_surf_all        # used by TetMesh.merge
             self.n_skin_verts = len(skin_v_np)
             self.n_skin_tets  = len(self.skin_shell.tets)
             merged_v, merged_t, merged_f = gtet.merge_numpy(
@@ -178,7 +200,7 @@ class UnifiedTorso:
                 (skin_v_np, skin_t_np, skin_f_surf.flatten()),
             )
         else:
-            skin_f_surf = None
+            skin_f_surf_outer = None
             self.n_skin_verts = 0
             self.n_skin_tets  = 0
             merged_v, merged_t, merged_f = gtet.merge_numpy(
@@ -189,8 +211,9 @@ class UnifiedTorso:
                                       rho=1.0, scale=1.0)
 
         # ── 3b. skin face-index field (global indices into unified mesh) ──
-        if skin_f_surf is not None and len(skin_f_surf) > 0:
-            global_skin_f = (skin_f_surf + self.skin_offset).flatten().astype(np.int32)
+        # Only outer-ring faces so the renderer uses correctly outward-pointing normals.
+        if skin_f_surf_outer is not None and len(skin_f_surf_outer) > 0:
+            global_skin_f = (skin_f_surf_outer + self.skin_offset).flatten().astype(np.int32)
             self.skin_f_i = ti.field(dtype=ti.i32, shape=len(global_skin_f))
             self.skin_f_i.from_numpy(global_skin_f)
         else:

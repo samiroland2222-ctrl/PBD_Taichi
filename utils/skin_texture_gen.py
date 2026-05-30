@@ -1008,83 +1008,80 @@ def _gen_height(
     Layers:
     - Pore dimples   : 3-D F1 Voronoi in world space (seamless across UV seams)
     - Micro-texture  : 3-D fBm opensimplex evaluated at world-space coords
+
+    Subsampling strategy (for large atlases):
+    ─────────────────────────────────────────
+    To keep evaluation cost below ``MAX_EVAL`` function calls we sample at
+    every ``step``-th masked pixel (regular grid stride in raster order).
+    The sparse result is filled back to full resolution using
+    ``scipy.ndimage.distance_transform_edt`` nearest-neighbour assignment,
+    which preserves the **correct amplitude** — unlike the old random-scatter
+    + Gaussian-blur approach which diluted the signal to near-zero at 4 K
+    (confirmed: height std ≈ 0.38/255 with the old method).
+    A light post-blur (sigma ≈ step / 2 px) then smooths the step boundaries.
     """
     height = np.zeros((H, W), np.float32)
 
     if not mask.any():
         return height
 
-    # Flat arrays of masked pixels
+    from scipy.ndimage import distance_transform_edt
+
+    # Flat arrays of ALL masked pixels
     rows, cols = np.where(mask)
-    wp = world_pos[rows, cols]    # (N, 3)
-
-    # World-space cell coordinates (no tangent-frame dependency → seamless)
-    x_c = wp[:, 0] / pore_cell_size
-    y_c = wp[:, 1] / pore_cell_size
-    z_c = wp[:, 2] / pore_cell_size
-
-    # Budget: cap samples at 200 K regardless of resolution.
-    # At 4 K with ~11 M masked pixels the blur sigma will be ~22 px,
-    # which softens the pore grid into fine micro-texture — exactly what
-    # smooth dewy skin should look like.  Keeping the cap fixed avoids
-    # the O(N_pixels) Voronoi loop that would take ~2 minutes at 4 K.
-    MAX_SAMPLES = 200_000
-
     N = len(rows)
 
-    # ── Pore layer ──────────────────────────────────────────────────────────
-    if N > MAX_SAMPLES:
-        idx_v = rng.choice(N, MAX_SAMPLES, replace=False)
-        f1_sub = _voronoi_f1_3d(x_c[idx_v], y_c[idx_v], z_c[idx_v], jitter=0.82)
-        f1_sparse = np.zeros(N, np.float32)
-        f1_sparse[idx_v] = f1_sub
-        f1_2d = np.zeros((H, W), np.float32)
-        np.add.at(f1_2d, (rows, cols), f1_sparse)
-        v_sigma = max(2.0, np.sqrt(float(N) / MAX_SAMPLES) * 2.0)
-        f1_2d = gaussian_filter(f1_2d, sigma=v_sigma)
-        f1 = f1_2d[rows, cols]
-    else:
-        f1 = _voronoi_f1_3d(x_c, y_c, z_c, jitter=0.82)
-    # 3-D Voronoi has typical max ~0.87 (cube diagonal / 2≈0.87)
+    # ── Choose stride so we evaluate ≤ MAX_EVAL points ───────────────────
+    MAX_EVAL = 200_000
+    step = max(1, int(np.ceil(np.sqrt(float(N) / MAX_EVAL))))
+    idx_eval = np.arange(0, N, step)                 # regular-stride sample
+
+    wp_eval = world_pos[rows[idx_eval], cols[idx_eval]]   # (n_eval, 3)
+
+    # World-space cell-unit coordinates (seamless: no UV dependency)
+    x_c = wp_eval[:, 0] / pore_cell_size
+    y_c = wp_eval[:, 1] / pore_cell_size
+    z_c = wp_eval[:, 2] / pore_cell_size
+
+    # ── Pore layer (Voronoi F1) ──────────────────────────────────────────
+    f1 = _voronoi_f1_3d(x_c, y_c, z_c, jitter=0.82)
     f1 = np.clip(f1 / 0.75, 0.0, 1.0)
-    # Gentle bowl shape — avoid sharp craters; smooth skin has rounded pores
-    pore_h = f1 ** 1.2    # was 2.0 (sharp craters) → 1.2 (gentle concavity)
+    pore_h = f1 ** 1.2    # gentle bowl shape
 
-    # ── Micro-texture layer (opensimplex fBm in world space) ──────────────
+    # ── Micro-texture layer (fBm opensimplex) ────────────────────────────
     freq_base = 1.0 / (pore_cell_size * 3.0)   # ~3× pore frequency
+    micro_raw = _fbm_opensimplex_3d(
+        wp_eval[:, 0] * freq_base,
+        wp_eval[:, 1] * freq_base,
+        wp_eval[:, 2] * freq_base,
+        octaves=3,
+    )
+    micro = (micro_raw * 0.5 + 0.5).astype(np.float32)   # [0, 1]
 
-    if N > MAX_SAMPLES:
-        # Subsample, then blur back to full coverage
-        idx_sub = rng.choice(N, MAX_SAMPLES, replace=False)
-        micro_sub = _fbm_opensimplex_3d(
-            wp[idx_sub, 0] * freq_base,
-            wp[idx_sub, 1] * freq_base,
-            wp[idx_sub, 2] * freq_base,
-            octaves=3,
-        )
-        micro_full_flat = np.zeros(N, np.float32)
-        micro_full_flat[idx_sub] = micro_sub
-        micro_2d = np.zeros((H, W), np.float32)
-        np.add.at(micro_2d, (rows, cols), micro_full_flat)
-        m_sigma = max(2.0, np.sqrt(float(N) / MAX_SAMPLES) * 1.5)
-        micro_2d = gaussian_filter(micro_2d, sigma=m_sigma)
-        micro = micro_2d[rows, cols]
+    # ── Combine at evaluation pixels ────────────────────────────────────
+    h_eval = (0.25 * pore_h + 0.75 * micro).astype(np.float32)
+
+    # ── Scatter into 2-D; neutral 0.5 elsewhere ─────────────────────────
+    h_sparse = np.full((H, W), np.nan, np.float32)
+    h_sparse[rows[idx_eval], cols[idx_eval]] = h_eval
+
+    # ── Nearest-neighbour fill (preserves correct amplitude) ─────────────
+    # For pixels not yet evaluated, find the closest evaluated pixel
+    # and copy its value.  This avoids the amplitude-dilution caused by
+    # Gaussian-blurring a mostly-zero sparse scatter image.
+    evaluated = np.isfinite(h_sparse)
+    if not evaluated.all():
+        _, (nr, nc) = distance_transform_edt(~evaluated, return_indices=True)
+        h_filled = np.where(evaluated, h_sparse, h_sparse[nr, nc])
     else:
-        micro = _fbm_opensimplex_3d(
-            wp[:, 0] * freq_base,
-            wp[:, 1] * freq_base,
-            wp[:, 2] * freq_base,
-            octaves=3,
-        )
+        h_filled = h_sparse
 
-    micro = (micro * 0.5 + 0.5).astype(np.float32)   # [0, 1]
+    # ── Light post-blur to smooth step-boundary discontinuities ──────────
+    if step > 1:
+        post_sigma = max(1.0, step * 0.6)
+        h_filled = gaussian_filter(h_filled, sigma=post_sigma)
 
-    # ── Combine ─────────────────────────────────────────────────────────────
-    # Dewy young skin: mostly smooth micro-texture, barely-visible pores.
-    # Weight pores at 25% and fBm micro-grain at 75% → no obvious crater grid.
-    h_pixels = 0.25 * pore_h + 0.75 * micro
-
-    height[rows, cols] = h_pixels
+    height[rows, cols] = h_filled[rows, cols]
 
     # Pre-fill border pixels so Sobel gradient doesn't glitch at seams
     height[~mask] = 0.5
@@ -1212,25 +1209,27 @@ def _gen_albedo(
     layer += facing[:, np.newaxis] * sun_tint
 
     # ── Pore colour: very faint darkening at pore centres (3-D world space) ──
+    from scipy.ndimage import distance_transform_edt as _edt
     wp = world_pos[rows, cols]   # (N, 3)
     x_c = wp[:, 0] / pore_cell_size
     y_c = wp[:, 1] / pore_cell_size
     z_c = wp[:, 2] / pore_cell_size
-    MAX_SAMPLES = 200_000
-    if N > MAX_SAMPLES:
-        idx_v = rng.choice(N, MAX_SAMPLES, replace=False)
-        f1_sub = _voronoi_f1_3d(x_c[idx_v], y_c[idx_v], z_c[idx_v], jitter=0.82)
-        f1_sparse = np.zeros(N, np.float32)
-        f1_sparse[idx_v] = f1_sub
-        f1_2d_a = np.zeros((H, W), np.float32)
-        np.add.at(f1_2d_a, (rows, cols), f1_sparse)
-        a_sigma = max(2.0, np.sqrt(float(N) / MAX_SAMPLES) * 2.5)
-        f1_2d_a = gaussian_filter(f1_2d_a, sigma=a_sigma)
-        f1 = f1_2d_a[rows, cols]
-    else:
-        f1 = _voronoi_f1_3d(x_c, y_c, z_c, jitter=0.82)
+    MAX_EVAL = 200_000
+    step_a = max(1, int(np.ceil(np.sqrt(float(N) / MAX_EVAL))))
+    idx_a = np.arange(0, N, step_a)
+    f1_eval = _voronoi_f1_3d(x_c[idx_a], y_c[idx_a], z_c[idx_a], jitter=0.82)
+    # Scatter to 2D and nearest-neighbour fill (preserves amplitude)
+    f1_2d_a = np.full((H, W), np.nan, np.float32)
+    f1_2d_a[rows[idx_a], cols[idx_a]] = f1_eval
+    have_a = np.isfinite(f1_2d_a)
+    if not have_a.all():
+        _, (nr_a, nc_a) = _edt(~have_a, return_indices=True)
+        f1_2d_a = np.where(have_a, f1_2d_a, f1_2d_a[nr_a, nc_a])
+    if step_a > 1:
+        f1_2d_a = gaussian_filter(f1_2d_a, sigma=max(1.0, step_a * 0.6))
+    f1 = f1_2d_a[rows, cols]
     f1 = np.clip(f1 / 0.75, 0.0, 1.0)
-    pore_dark = (1.0 - f1 ** 3) * 0.04    # very faint darkening at pore centre (was 0.07)
+    pore_dark = (1.0 - f1 ** 3) * 0.04    # very faint darkening at pore centre
     layer -= pore_dark[:, np.newaxis]
 
     # ── Freckles ─────────────────────────────────────────────────────────────

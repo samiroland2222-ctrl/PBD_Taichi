@@ -73,7 +73,7 @@ torso = UnifiedTorso(
     breast_target_tets=600,
     ribcage_verts_np=ribcage_verts,
     ribcage_faces_np=ribcage_mesh.faces_np,
-    skin_target_n_tets=10000,
+    skin_target_n_tets=20000,   # was 10000 — 2× more outer tris → ~4–5 mm edges, smoother surface
     skin_thickness=0.02,
     g=g,
     dt=dt,
@@ -123,7 +123,7 @@ def _build_skin_textures(seed: int):
         base_roughness=0.55,   # was 0.27 — prevented plastic-like shininess
         dewy_intensity=0.10,
         emissive_intensity=0.08,
-        normal_strength=0.35,  # subtle bumps for smooth dewy skin
+        normal_strength=0.25,  # subtle pore/micro-texture bumps (0.35 was too strong)
         verbose=True,
         debug_save_dir="/tmp/skin_debug",   # saves atlas PNGs + mesh-overlay PNGs
     )
@@ -183,7 +183,7 @@ if torso.skin_f_i is not None:
 # ── GUI ───────────────────────────────────────────────────────────────────────
 # PBR knobs (wgpu only) — adjusted live via the material properties
 _emissive_intensity = [0.09]
-_normal_strength    = [0.60]
+_normal_strength    = [0.25]   # matches the baked normal_strength; 0–1 range on slider
 log_b_hydro   = [math.log10(torso.deform_breast.hydro_alpha)]
 log_b_devia   = [math.log10(torso.deform_breast.devia_alpha)]
 log_s_hydro   = [math.log10(torso.deform_skin.hydro_alpha)]  if torso.deform_skin else [math.log10(SKIN_HYDRO_ALPHA)]
@@ -264,10 +264,10 @@ def gui_draw(gui):
             _emissive_intensity[0] = gui.slider_float(
                 "SSS emissive", _emissive_intensity[0], 0.0, 0.5)
             _normal_strength[0] = gui.slider_float(
-                "Normal strength", _normal_strength[0], 0.0, 2.0)
+                "Normal strength", _normal_strength[0], 0.0, 1.0)
             # Apply to the live material immediately
             _skin_tex.material.emissive_intensity = _emissive_intensity[0]
-            ns = _normal_strength[0] * 0.6
+            ns = _normal_strength[0]   # direct: 0 = flat, 1 = full baked amplitude
             _skin_tex.material.normal_scale = (ns, ns)
             gui.text("  Press T to regenerate textures (new seed)")
 
