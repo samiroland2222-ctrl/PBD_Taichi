@@ -65,7 +65,7 @@ dt         = 1.0 / (fps * substep)
 ribcage_verts = ribcage_mesh.v_p.to_numpy()
 torso = UnifiedTorso(
     skel,
-    breast_height=0.04,
+    breast_height=0.08,
     breast_radius=0.06,
     breast_k=1.0,
     breast_spread=0.6,
@@ -112,6 +112,11 @@ def _build_skin_textures(seed: int):
     faces_np = torso.skin_f_i.to_numpy().reshape(-1, 3)
     if len(faces_np) == 0:
         return None
+
+    # Phase 2a: compute per-vertex thinness from skin shell binding distances.
+    # thin=1 → close to anatomy (ears/thin areas → stronger SSS glow).
+    thickness_pv = torso.get_skin_thickness_per_vert_np()
+
     print(f"[skin PBR] generating textures (seed={seed}, "
           f"{len(verts_np)} verts, {len(faces_np)} faces) …")
     tex = _gen_skin_tex(
@@ -124,6 +129,7 @@ def _build_skin_textures(seed: int):
         dewy_intensity=0.10,
         emissive_intensity=0.08,
         normal_strength=0.25,  # subtle pore/micro-texture bumps (0.35 was too strong)
+        thickness_per_vertex=thickness_pv,   # Phase 2: modulates SSS emissive glow
         verbose=True,
         debug_save_dir="/tmp/skin_debug",   # saves atlas PNGs + mesh-overlay PNGs
     )

@@ -192,8 +192,9 @@ class UnifiedTorso:
             # Merge uses ALL surface faces (for internal TetMesh f field),
             # but skin_f_i stores only OUTER faces (for rendering + UV atlas).
             skin_f_surf = skin_f_surf_all        # used by TetMesh.merge
-            self.n_skin_verts = len(skin_v_np)
-            self.n_skin_tets  = len(self.skin_shell.tets)
+            self.n_skin_verts       = len(skin_v_np)
+            self.n_skin_inner_verts = n_v_half   # inner ring: [0, n_v_half); outer: [n_v_half, …)
+            self.n_skin_tets        = len(self.skin_shell.tets)
             merged_v, merged_t, merged_f = gtet.merge_numpy(
                 (v_l, t_l, f_l),
                 (v_r, t_r, f_r),
@@ -201,8 +202,9 @@ class UnifiedTorso:
             )
         else:
             skin_f_surf_outer = None
-            self.n_skin_verts = 0
-            self.n_skin_tets  = 0
+            self.n_skin_verts       = 0
+            self.n_skin_inner_verts = 0
+            self.n_skin_tets        = 0
             merged_v, merged_t, merged_f = gtet.merge_numpy(
                 (v_l, t_l, f_l),
                 (v_r, t_r, f_r),
@@ -512,6 +514,54 @@ class UnifiedTorso:
                    + uvw[2] * verts[tri[2]])
             targets.append(pt)
         return np.array(targets, dtype=np.float32)
+
+    # ------------------------------------------------------------------
+    # Skin thickness helper (Phase 2 texture baking)
+    # ------------------------------------------------------------------
+    def get_skin_thickness_per_vert_np(self) -> np.ndarray:
+        """Return a (N,) float32 array of normalised thinness for each vertex
+        in the unified mesh.  ``1.0`` = very thin skin (close to anatomy);
+        ``0.0`` = thick (large subcutaneous-fat gap).
+
+        Non-skin verts (breast tets, inner ring) receive 0.0 so they do not
+        contribute to the emissive map even if the UV atlas happens to sample
+        them.
+
+        The thinness is derived from the binding distances stored during skin
+        shell construction: the distance from each inner-ring vertex to the
+        nearest anatomy surface triangle.  A small distance means the skin is
+        pressed close to the anatomy → thin → stronger SSS glow.
+        """
+        n_total = self.skin_mesh.n_vert
+        thickness = np.zeros(n_total, dtype=np.float32)
+
+        if not self.barycentric_bindings or self.n_skin_inner_verts == 0:
+            return thickness  # nothing to fill
+
+        # Collect per-inner-vert distances from barycentric bindings.
+        # b.skin_vertex_index is in [0, n_inner).  Outer vert i_outer = i + n_inner.
+        n_inner = self.n_skin_inner_verts
+        dist_inner = np.zeros(n_inner, dtype=np.float32)
+        for b in self.barycentric_bindings:
+            vi = int(b.skin_vertex_index)
+            if 0 <= vi < n_inner:
+                dist_inner[vi] = float(b.skin_vertex_distance)
+
+        # Normalise: thin areas have small dist → thinness = 1 − dist/max_dist
+        max_dist = float(dist_inner.max())
+        if max_dist < 1e-8:
+            thin_inner = np.ones(n_inner, dtype=np.float32)
+        else:
+            thin_inner = 1.0 - np.clip(dist_inner / max_dist, 0.0, 1.0)
+
+        # Write outer-ring thinness into global vert array.
+        # Global indices of outer skin ring: [skin_offset+n_inner, skin_offset+n_skin_verts)
+        outer_start = self.skin_offset + n_inner
+        outer_end   = self.skin_offset + self.n_skin_verts
+        # Outer vert (global: outer_start + i) ↔ inner vert (local: i)
+        thickness[outer_start:outer_end] = thin_inner
+
+        return thickness
 
     # ------------------------------------------------------------------
     # Rendering

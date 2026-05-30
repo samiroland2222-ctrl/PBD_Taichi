@@ -136,29 +136,82 @@ class WgpuSceneProxy:
     """Drop-in for ti.ui.Scene for the wgpu backend.
     Caches pygfx world-objects created on the first invocation of each
     draw-callback.  On every subsequent call only the mutable buffers
-    (positions, colours) are updated.
+    (positions, colours) are refreshed each frame.
+
+    X-slice (topological clip)
+    --------------------------
+    When ``clip_plane_enabled`` is True, any triangle whose vertices do
+    **not** all satisfy ``x >= clip_x`` is replaced by a degenerate
+    triangle (vertex 0 repeated three times) so it is invisible.  The
+    full original index buffer is stored and restored when the clip is
+    turned off.  The operation is purely topological: no subdivision of
+    boundary triangles is done — triangles that span the cut are simply
+    removed.
     """
     def __init__(self, scene: pygfx.Scene, force_two_sided: bool = False):
         self._scene = scene
         self._force_two_sided = force_two_sided
-        # id(taichi_field) -> (world_obj, geometry)
+        # Topological X-slice state (set by WgpuRenderer3D._draw_cb each frame)
+        self.clip_plane_enabled: bool = False
+        self.clip_x: float = 0.0
+        self.clip_x_flip: bool = False  # False → keep x≥clip_x; True → keep x≤clip_x
+        # id(taichi_field) -> (world_obj, geometry, idx_full_f3)
         self._meshes: dict = {}
         # id(taichi_field) -> (line_obj, geometry, indices_np)
         self._lines: dict = {}
         # id(taichi_field) -> (pts_obj, geometry, has_vertex_color)
         self._points: dict = {}
-        # id(taichi_field) -> (mesh_obj, geometry, vmapping)  — PBR skin meshes
+        # id(taichi_field) -> (mesh_obj, geometry, vmapping, idx_full_f3) — PBR skin meshes
         self._skin_meshes: dict = {}
+
+    # ------------------------------------------------------------------ clip helper
+
+    def _apply_clip_to_indices(
+        self,
+        geo,
+        idx_full_f3: np.ndarray,  # (F, 3) int32 — full unclipped faces
+        verts_f3: np.ndarray,     # (V, 3) float32 — vertex positions for this mesh
+    ) -> None:
+        """Update the geometry's index buffer for the current clip state.
+
+        When the clip is **enabled**: triangles where any vertex has
+        ``x < clip_x`` are replaced by degenerate triangle (0, 0, 0).
+        When the clip is **disabled**: the full unclipped index buffer is
+        restored.  The buffer is always marked dirty so wgpu re-uploads it.
+        """
+        if self.clip_plane_enabled:
+            xi = verts_f3[:, 0]                     # (V,) x-coordinates
+            tri = idx_full_f3                        # (F, 3)
+            if self.clip_x_flip:
+                # Keep triangles where all vertices have x ≤ clip_x
+                keep = (
+                    (xi[tri[:, 0]] <= self.clip_x) &
+                    (xi[tri[:, 1]] <= self.clip_x) &
+                    (xi[tri[:, 2]] <= self.clip_x)
+                )
+            else:
+                # Keep triangles where all vertices have x ≥ clip_x
+                keep = (
+                    (xi[tri[:, 0]] >= self.clip_x) &
+                    (xi[tri[:, 1]] >= self.clip_x) &
+                    (xi[tri[:, 2]] >= self.clip_x)
+                )
+            out = idx_full_f3.copy()
+            out[~keep] = 0                           # degenerate → zero-area, invisible
+            geo.indices.data[:] = out
+        else:
+            geo.indices.data[:] = idx_full_f3
+        geo.indices.update_range()
     # ------------------------------------------------------------------ mesh
     def mesh(self, vertices, indices, color=(0.5, 0.5, 0.5),
              show_wireframe=False, two_sided=False, **kwargs):
         verts_np = _to_np_verts(vertices)
         key = id(vertices)
         if key not in self._meshes:
-            idx_np = _to_np_indices(indices).reshape(-1, 3).astype(np.int32)
+            idx_full = _to_np_indices(indices).reshape(-1, 3).astype(np.int32)
             geo = pygfx.Geometry(
                 positions=verts_np.copy(),
-                indices=idx_np,
+                indices=idx_full.copy(),
             )
             rgba = _rgba(color)
             mat = pygfx.MeshPhongMaterial(
@@ -168,11 +221,15 @@ class WgpuSceneProxy:
             )
             obj = pygfx.Mesh(geo, mat)
             self._scene.add(obj)
-            self._meshes[key] = (obj, geo)
+            self._meshes[key] = (obj, geo, idx_full)
+            # Apply clip on first frame too
+            self._apply_clip_to_indices(geo, idx_full, verts_np)
         else:
-            _obj, geo = self._meshes[key]
+            _obj, geo, idx_full = self._meshes[key]
             geo.positions.data[:] = verts_np
             geo.positions.update_range()
+            # Re-apply clip every frame (vertex positions change → re-test)
+            self._apply_clip_to_indices(geo, idx_full, verts_np)
 
     # ------------------------------------------------------------ skin_mesh
     def skin_mesh(self, vertices, skin_tex, recompute_normals: bool = True, **kwargs):
@@ -206,22 +263,28 @@ class WgpuSceneProxy:
                 positions=v_rem,
                 normals=normals,
                 texcoords=np.ascontiguousarray(uvs),
-                indices=np.ascontiguousarray(idx_new),
+                indices=np.ascontiguousarray(idx_new.copy()),
             )
             obj = pygfx.Mesh(geo, skin_tex.material)
             self._scene.add(obj)
-            self._skin_meshes[key] = (obj, geo, vmapping)
+            self._skin_meshes[key] = (obj, geo, vmapping, idx_new)
+            # Apply clip on first frame
+            self._apply_clip_to_indices(geo, idx_new, v_rem)
 
         else:
             # ── Subsequent frames: update positions (+ optional normals) ───
-            _obj, geo, vmapping = self._skin_meshes[key]
+            _obj, geo, vmapping, idx_full = self._skin_meshes[key]
             v_rem = np.ascontiguousarray(verts_np[vmapping])
             geo.positions.data[:] = v_rem
             geo.positions.update_range()
             if recompute_normals:
-                normals = _normals_from_verts(v_rem, geo.indices.data)
+                # Always use full (unclipped) indices for normals so that
+                # degenerate clip triangles (0,0,0) don't skew vertex 0's normal.
+                normals = _normals_from_verts(v_rem, idx_full)
                 geo.normals.data[:] = normals
                 geo.normals.update_range()
+            # Re-apply clip (deformed mesh → vertex x-coords change each frame)
+            self._apply_clip_to_indices(geo, idx_full, v_rem)
 
     # ----------------------------------------------------------------- lines
     def lines(self, vertices, width, indices, color=(0.5, 0.5, 0.5), **kwargs):
@@ -424,6 +487,9 @@ class WgpuRenderer3D:
         # X-slice
         self.clip_plane_enabled = False
         self.clip_x             = 0.0
+        self.clip_x_min         = -0.5   # slider lower bound (world-units)
+        self.clip_x_max         =  0.5   # slider upper bound (world-units)
+        self.clip_x_flip        = False  # False → show x≥clip_x; True → show x≤clip_x
         self._z_near_default    = 0.001
 
         # Surface-normals overlay
@@ -482,7 +548,8 @@ class WgpuRenderer3D:
 
         # Ambient (replaces the existing one)
         self._scene.remove(self._scene.children[0])   # existing AmbientLight
-        self._scene.add(pygfx.AmbientLight(color=(0.60, 0.63, 0.70), intensity=0.25))
+        # Warm-neutral ambient — avoid cool/blue cast that makes skin look purple-grey
+        self._scene.add(pygfx.AmbientLight(color=(0.70, 0.65, 0.60), intensity=0.30))
 
         # Key light — warm white, upper-left-front — follows camera
         key = pygfx.DirectionalLight(color=(0.99, 0.95, 0.88), intensity=1.20)
@@ -490,8 +557,8 @@ class WgpuRenderer3D:
         key.look_at((0.0, 0.0, 0.0))
         self._scene.add(key)
 
-        # Fill light — cool, right-back
-        fill = pygfx.DirectionalLight(color=(0.60, 0.65, 0.72), intensity=0.30)
+        # Fill light — neutral (not blue), right-back
+        fill = pygfx.DirectionalLight(color=(0.75, 0.72, 0.70), intensity=0.25)
         fill.local.position = np.array([1.0, 0.3, -0.8])
         fill.look_at((0.0, 0.0, 0.0))
         self._scene.add(fill)
@@ -560,10 +627,13 @@ class WgpuRenderer3D:
                 "Enable X-slice", self.clip_plane_enabled)
             if self.clip_plane_enabled:
                 _c, self.clip_x = imgui.slider_float(
-                    "clip_x", self.clip_x, -0.5, 0.5)
-                imgui.text(f"  near clip @ x = {self.clip_x:.3f} m")
+                    "clip_x", self.clip_x, self.clip_x_min, self.clip_x_max)
+                _c, self.clip_x_flip = imgui.checkbox(
+                    "Flip (keep x ≤ clip_x)", self.clip_x_flip)
+                side = "x ≤ {:.3f}" if self.clip_x_flip else "x ≥ {:.3f}"
+                imgui.text(f"  keeping {side.format(self.clip_x)}")
             else:
-                imgui.text("  (disabled – near clip = default)")
+                imgui.text("  (disabled)")
 
             imgui.separator()
             imgui.text("── Surface Normals ──")
@@ -658,7 +728,11 @@ class WgpuRenderer3D:
     def _draw_cb(self) -> None:
         """Registered with the canvas; invoked by canvas.force_draw()."""
         self._point_light.local.position = self.camera.world.position.copy()
-        self._proxy._force_two_sided = self.clip_plane_enabled
+        # Sync clip state to proxy so _apply_clip_to_indices uses current values
+        self._proxy._force_two_sided   = self.clip_plane_enabled
+        self._proxy.clip_plane_enabled = self.clip_plane_enabled
+        self._proxy.clip_x             = self.clip_x
+        self._proxy.clip_x_flip        = self.clip_x_flip
         for draw_fn in self.scene_render_list:
             draw_fn(self._proxy)
         self.renderer.render(self._scene, self.camera)
@@ -733,12 +807,7 @@ class WgpuRenderer3D:
                 scale   = float(self.surface_normals_scale)
                 seg[0::2] = verts
                 seg[1::2] = verts + normals * scale
-            else:
-                # Degenerate (zero-length) segments are invisible
-                seg[0::2] = verts
-                seg[1::2] = verts
-
-            scene.lines(seg, 1.5, _state['indices'], color=color)
+                scene.lines(seg, 1.5, _state['indices'], color=color)
 
         return _draw
 
