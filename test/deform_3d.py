@@ -19,6 +19,18 @@ try:
 except ImportError:
     _SKIN_TEX_AVAILABLE = False
 
+# ── Nipple geometry support ───────────────────────────────────────────────────
+try:
+    from PBD_Taichi.geom.nipple import (
+        make_nipple_pair, eval_hires_positions,
+        set_firmness, refresh_hires,
+        _NIPPLE_H_FIRM, _NIPPLE_H_RELAX,
+        _NIPPLE_R_TIP_FIRM, _NIPPLE_R_TIP_RELAX, _NIPPLE_RADIUS,
+    )
+    _NIPPLE_AVAILABLE = True
+except ImportError:
+    _NIPPLE_AVAILABLE = False
+
 ti.init(arch=ti.cpu, cpu_max_num_threads=1)
 
 # ── Ribcage mesh (static visual + optional skin anchor source) ────────────────
@@ -90,6 +102,67 @@ bb.from_numpy(bb_np)
 box3d = obj.BoundBox3D(bound_box=bb, padding=0.01, bound_epsilon=1e-6)
 torso.xpbd.add_collision(box3d.collision)
 
+# ── Nipple geometry ───────────────────────────────────────────────────────────
+# Build one NippleGeometry per breast.  The hi-res mesh is a pure rendering
+# overlay (not in the PBD solver); it follows the breast apex each frame via
+# barycentric tracking.
+_nipple_l = _nipple_r = None
+_nipple_l_vp = _nipple_l_fi = None   # Taichi fields (set below if available)
+_nipple_r_vp = _nipple_r_fi = None
+
+if _NIPPLE_AVAILABLE:
+    try:
+        _ref_verts = torso.skin_mesh.v_p_ref.to_numpy()
+        _bl_v_rest = _ref_verts[:torso.n_left_verts].astype(np.float32)
+        _br_v_rest = _ref_verts[torso.n_left_verts:
+                                 torso.n_left_verts + torso.n_right_verts].astype(np.float32)
+
+        # ── Skin outer-shell anchor mesh ────────────────────────────────────
+        # The nipple cage base vertices are bound to the extruded outer skin
+        # layer so they track the skin surface, not the underlying breast flesh.
+        _skin_outer_anchor_verts = None
+        _skin_outer_anchor_faces = None
+        if (torso._skin_outer_vert_offset is not None
+                and torso._skin_outer_faces_np is not None):
+            _skin_outer_n = torso.n_skin_verts - torso.n_skin_inner_verts
+            _skin_outer_start = torso._skin_outer_vert_offset
+            _skin_outer_anchor_verts = _ref_verts[
+                _skin_outer_start : _skin_outer_start + _skin_outer_n
+            ].astype(np.float32)
+            _skin_outer_anchor_faces = torso._skin_outer_faces_np
+            print(f"[nipple] skin outer anchor: {len(_skin_outer_anchor_verts)} verts, "
+                  f"{len(_skin_outer_anchor_faces)} faces")
+
+        _nipple_l, _nipple_r = make_nipple_pair(
+            _bl_v_rest, torso._breast_l_faces_np,
+            _br_v_rest, torso._breast_r_faces_np,
+            base_l_vertex_indices=torso._breast_l_base_local_np,
+            base_r_vertex_indices=torso._breast_r_base_local_np,
+            anchor_verts=_skin_outer_anchor_verts,
+            anchor_faces=_skin_outer_anchor_faces,
+            n_sides=4, hires_segs=16, hires_rings=7,
+        )
+        # Create Taichi fields for the hi-res vertices (updated each frame)
+        _nipple_l_vp = ti.Vector.field(3, dtype=ti.f32, shape=len(_nipple_l.hires_verts))
+        _nipple_r_vp = ti.Vector.field(3, dtype=ti.f32, shape=len(_nipple_r.hires_verts))
+        _nipple_l_vp.from_numpy(_nipple_l.hires_verts)
+        _nipple_r_vp.from_numpy(_nipple_r.hires_verts)
+        # Taichi fields for static face indices
+        _nl_fi_np = _nipple_l.hires_faces.flatten().astype(np.int32)
+        _nr_fi_np = _nipple_r.hires_faces.flatten().astype(np.int32)
+        _nipple_l_fi = ti.field(dtype=ti.i32, shape=len(_nl_fi_np))
+        _nipple_r_fi = ti.field(dtype=ti.i32, shape=len(_nr_fi_np))
+        _nipple_l_fi.from_numpy(_nl_fi_np)
+        _nipple_r_fi.from_numpy(_nr_fi_np)
+        print(f"[nipple] built: L={len(_nipple_l.hires_verts)} verts "
+              f"{len(_nipple_l.hires_faces)} tris | "
+              f"R={len(_nipple_r.hires_verts)} verts "
+              f"{len(_nipple_r.hires_faces)} tris")
+    except Exception as _e:
+        print(f"[nipple] WARNING: failed to build nipple geometry: {_e}")
+        import traceback; traceback.print_exc()
+        _nipple_l = _nipple_r = None
+
 # ── Renderer ──────────────────────────────────────────────────────────────────
 tirender = renderer.TaichiRenderer3D("Deform 3D – Unified Torso",
                                      res=(900, 900), fps=fps,
@@ -103,6 +176,17 @@ _wgpu = hasattr(tirender, 'setup_skin_lighting')
 _skin_tex       = None   # SkinTextures instance (or None)
 _skin_tex_seed  = [42]   # mutable so the keybind closure can update it
 _pbr_skin_on    = [True] # GUI toggle — live switch between PBR and flat-color
+
+# Phase 6 / 4 / 5 skin params — applied on next T-key regen
+_skin_params = {
+    'melanin_amount':      [0.076],    # Phase 6: 0=albino, 1=dark
+    'haemo_amount':        [0.38],    # Phase 6: 0=bloodless, 1=flushed
+    'oxygenation':         [0.831],    # Phase 6: 0=cyanotic, 1=healthy
+    'clearcoat':           [0.054],    # Phase 4: oil/sebum layer strength
+    'clearcoat_roughness': [0.174],    # Phase 4: sharpness of oil highlight
+    'sheen':               [0.2688],    # Phase 5: peach-fuzz intensity
+    'sheen_roughness':     [0.402],    # Phase 5: fuzz softness
+}
 
 def _build_skin_textures(seed: int):
     """Generate (or regenerate) skin PBR textures from the current skin mesh."""
@@ -125,20 +209,54 @@ def _build_skin_textures(seed: int):
         seed=seed,
         # pore_cell_size=0 → auto-scales to 1/180 of bbox diagonal (fine micro-texture)
         freckle_density=0.40,
-        base_roughness=0.55,   # was 0.27 — prevented plastic-like shininess
+        base_roughness=0.55,
         dewy_intensity=0.10,
         emissive_intensity=0.08,
-        normal_strength=0.25,  # subtle pore/micro-texture bumps (0.35 was too strong)
+        normal_strength=0.25,
         thickness_per_vertex=thickness_pv,   # Phase 2: modulates SSS emissive glow
+        # Phase 6: spectral skin colour model
+        melanin_amount      = _skin_params['melanin_amount'][0],
+        haemo_amount        = _skin_params['haemo_amount'][0],
+        oxygenation         = _skin_params['oxygenation'][0],
+        # Phase 4: clearcoat (dual-lobe specular)
+        clearcoat           = _skin_params['clearcoat'][0],
+        clearcoat_roughness = _skin_params['clearcoat_roughness'][0],
+        # Phase 5: sheen (peach-fuzz)
+        sheen               = _skin_params['sheen'][0],
+        sheen_roughness     = _skin_params['sheen_roughness'][0],
         verbose=True,
         debug_save_dir="/tmp/skin_debug",   # saves atlas PNGs + mesh-overlay PNGs
     )
     if tex is not None:
         tex.save_with_overlay("/tmp/skin_debug", prefix="skin")
+
+    # ── Paint areola / nipple pigmentation onto the skin atlas ───────────────
+    if tex is not None and _nipple_l is not None:
+        try:
+            from PBD_Taichi.utils.nipple_texture import paint_nipple_areola, bake_world_pos_map
+            world_pos_map, atlas_mask = bake_world_pos_map(verts_np, tex)
+            for nip in [_nipple_l, _nipple_r]:
+                paint_nipple_areola(
+                    tex,
+                    world_pos_map  = world_pos_map,
+                    mask           = atlas_mask,
+                    nipple_center  = nip.apex_world,
+                    melanin_amount = _skin_params['melanin_amount'][0],
+                    haemo_amount   = _skin_params['haemo_amount'][0],
+                    oxygenation    = _skin_params['oxygenation'][0],
+                    rebuild_gpu_textures = True,
+                    verbose=True,
+                )
+            print("[skin PBR] nipple/areola painted onto atlas")
+        except Exception as _tex_e:
+            print(f"[skin PBR] WARNING: nipple texture painting failed: {_tex_e}")
+            import traceback; traceback.print_exc()
+
     return tex
 
 if _wgpu:
     tirender.setup_skin_lighting()
+    tirender.setup_sss(sss_strength=0.28, sigma_r=5.0, sigma_g=3.0, sigma_b=1.5)
     _skin_tex = _build_skin_textures(_skin_tex_seed[0])
 
 skin_color = (0.85, 0.65, 0.55)
@@ -177,6 +295,20 @@ for draw in torso.get_ligament_draws():
 for draw in torso.get_skin_anchor_draws():   # reddish bilateral breast-skin springs
     tirender.add_scene_render_draw(draw)
 
+# ── Nipple render draws ───────────────────────────────────────────────────────
+# Rendered as a separate mesh overlay on top of the breast/skin surface.
+# The hi-res verts are updated each frame from the breast apex barycentric tracking.
+_nipple_color = (0.70, 0.40, 0.30)  # warm-terracotta areola tint (flat renderer)
+if _nipple_l is not None and _nipple_l_vp is not None:
+    def _draw_nipple_l(scene):
+        scene.mesh(_nipple_l_vp, _nipple_l_fi,
+                   color=_nipple_color, show_wireframe=False, two_sided=True)
+    def _draw_nipple_r(scene):
+        scene.mesh(_nipple_r_vp, _nipple_r_fi,
+                   color=_nipple_color, show_wireframe=False, two_sided=True)
+    tirender.add_scene_render_draw(_draw_nipple_l)
+    tirender.add_scene_render_draw(_draw_nipple_r)
+
 # ── Surface-normal overlay (wgpu backend: yellow lines; Taichi backend: no-op) ─
 if torso.skin_f_i is not None:
     _skin_fi_np = torso.skin_f_i.to_numpy().reshape(-1, 3)
@@ -188,8 +320,9 @@ if torso.skin_f_i is not None:
 
 # ── GUI ───────────────────────────────────────────────────────────────────────
 # PBR knobs (wgpu only) — adjusted live via the material properties
-_emissive_intensity = [0.09]
-_normal_strength    = [0.25]   # matches the baked normal_strength; 0–1 range on slider
+_emissive_intensity = [0.312]
+_normal_strength    = [0.406]   # matches the baked normal_strength; 0–1 range on slider
+_nipple_firmness    = [0.0]     # 0=flat/relaxed, 1=firm/erect
 log_b_hydro   = [math.log10(torso.deform_breast.hydro_alpha)]
 log_b_devia   = [math.log10(torso.deform_breast.devia_alpha)]
 log_s_hydro   = [math.log10(torso.deform_skin.hydro_alpha)]  if torso.deform_skin else [math.log10(SKIN_HYDRO_ALPHA)]
@@ -273,9 +406,65 @@ def gui_draw(gui):
                 "Normal strength", _normal_strength[0], 0.0, 1.0)
             # Apply to the live material immediately
             _skin_tex.material.emissive_intensity = _emissive_intensity[0]
-            ns = _normal_strength[0]   # direct: 0 = flat, 1 = full baked amplitude
+            ns = _normal_strength[0]
             _skin_tex.material.normal_scale = (ns, ns)
+
+            # ── Phase 4: clearcoat (live, no regen needed) ─────────────────
+            gui.text("-- Clearcoat (oil/sebum layer) --")
+            _skin_params['clearcoat'][0] = gui.slider_float(
+                "Clearcoat", _skin_params['clearcoat'][0], 0.0, 1.0)
+            _skin_params['clearcoat_roughness'][0] = gui.slider_float(
+                "Coat roughness", _skin_params['clearcoat_roughness'][0], 0.0, 1.0)
+            _skin_tex.material.clearcoat = _skin_params['clearcoat'][0]
+            _skin_tex.material.clearcoat_roughness = _skin_params['clearcoat_roughness'][0]
+
+            # ── Phase 5: sheen (live, no regen needed) ─────────────────────
+            gui.text("-- Sheen (peach-fuzz) --")
+            _skin_params['sheen'][0] = gui.slider_float(
+                "Sheen", _skin_params['sheen'][0], 0.0, 1.0)
+            _skin_params['sheen_roughness'][0] = gui.slider_float(
+                "Sheen roughness", _skin_params['sheen_roughness'][0], 0.0, 1.0)
+            _skin_tex.material.sheen = _skin_params['sheen'][0]
+            _skin_tex.material.sheen_roughness = _skin_params['sheen_roughness'][0]
+
+            # ── Phase 6: spectral skin tone (requires T-key regen) ─────────
+            gui.text("-- Skin tone (press T to regen) --")
+            _skin_params['melanin_amount'][0] = gui.slider_float(
+                "Melanin", _skin_params['melanin_amount'][0], 0.0, 1.0)
+            _skin_params['haemo_amount'][0] = gui.slider_float(
+                "Haemoglobin", _skin_params['haemo_amount'][0], 0.0, 1.0)
+            _skin_params['oxygenation'][0] = gui.slider_float(
+                "Oxygenation", _skin_params['oxygenation'][0], 0.0, 1.0)
+            # Show predicted base colour from the spectral model
+            try:
+                from utils.skin_texture_gen import spectral_skin_base_color
+                import numpy as _np
+                c = spectral_skin_base_color(
+                    _skin_params['melanin_amount'][0],
+                    _skin_params['haemo_amount'][0],
+                    _skin_params['oxygenation'][0],
+                )
+                # sRGB for display (gamma encode)
+                cs = _np.clip(1.055 * _np.power(_np.clip(c, 0, 1), 1/2.4) - 0.055, 0, 1)
+                gui.text(f"  sRGB≈ ({cs[0]:.2f},{cs[1]:.2f},{cs[2]:.2f})  (press T to apply)")
+            except Exception:
+                pass
+
             gui.text("  Press T to regenerate textures (new seed)")
+
+    # ── Nipple firmness ───────────────────────────────────────────────────────
+    if _nipple_l is not None:
+        gui.text("-- Nipple erection --")
+        new_firmness = gui.slider_float("Firmness", _nipple_firmness[0], 0.0, 1.0)
+        if new_firmness != _nipple_firmness[0]:
+            _nipple_firmness[0] = new_firmness
+            set_firmness(_nipple_l, new_firmness)
+            refresh_hires(_nipple_l)
+            _nipple_l_vp.from_numpy(_nipple_l.hires_verts)
+            set_firmness(_nipple_r, new_firmness)
+            refresh_hires(_nipple_r)
+            _nipple_r_vp.from_numpy(_nipple_r.hires_verts)
+        gui.text(f"  {'flat/relaxed' if _nipple_firmness[0] < 0.1 else 'firm/erect' if _nipple_firmness[0] > 0.9 else 'transitioning'}  ({_nipple_firmness[0]:.2f})")
 
 tirender.add_gui_draw(gui_draw)
 
@@ -311,6 +500,111 @@ if _wgpu and _SKIN_TEX_AVAILABLE:
             _skin_tex.material.emissive_intensity = _emissive_intensity[0]
         print(f"[skin PBR] regenerated (seed={_skin_tex_seed[0]})")
     tirender.add_click_event('t', _regen_skin_textures)
+
+# ── Nipple per-frame update ───────────────────────────────────────────────────
+
+def _update_nipple_cage_from_breast(nipple, breast_verts_current, breast_faces):
+    """Drive the nipple cage from current breast vertex positions.
+
+    Base ring verts (cage indices 0..S-1) are positioned via their
+    BarycentricBindingDefinitions.  Tip ring + centre are reconstructed
+    from the current base centroid and the initial outward normal.
+    """
+    S = len(nipple.cage_bindings)  # == n_sides (4)
+    h = float(_NIPPLE_H_RELAX + nipple.firmness * (_NIPPLE_H_FIRM  - _NIPPLE_H_RELAX))
+    r_tip = float(_NIPPLE_R_TIP_RELAX + nipple.firmness * (_NIPPLE_R_TIP_FIRM - _NIPPLE_R_TIP_RELAX))
+
+    # 1. Update base ring from barycentric bindings onto breast surface
+    for b in nipple.cage_bindings:
+        fi = b.anchor_bary_face
+        w  = b.anchor_bary_uvw        # (3,)
+        tri = breast_faces[fi]         # [v0, v1, v2]
+        pos = (w[0] * breast_verts_current[tri[0]]
+             + w[1] * breast_verts_current[tri[1]]
+             + w[2] * breast_verts_current[tri[2]])
+        nipple.cage_verts[b.skin_vertex_index] = pos
+
+    # 2. Estimate current outward normal from the updated base ring
+    base_ring  = nipple.cage_verts[:S]              # (S, 3)
+    centroid   = base_ring.mean(axis=0)             # (3,)
+    # Cross product of the two base-ring diagonals gives a good normal estimate
+    if S >= 3:
+        d1 = (base_ring[2] - base_ring[0]).astype(np.float64)
+        d2 = (base_ring[3 % S] - base_ring[1 % S]).astype(np.float64)
+        est_n = np.cross(d1, d2)
+        nlen  = np.linalg.norm(est_n)
+        if nlen > 1e-9:
+            est_n /= nlen
+        else:
+            est_n = nipple.apex_frame[:, 0].astype(np.float64)
+    else:
+        est_n = nipple.apex_frame[:, 0].astype(np.float64)
+
+    # Blend estimated normal with the initial normal to resist flipping
+    init_n = nipple.apex_frame[:, 0].astype(np.float64)
+    if np.dot(est_n, init_n) < 0:
+        est_n = init_n           # fallback if base ring flipped (degenerate)
+    n_hat = (0.5 * est_n + 0.5 * init_n)
+    n_len = np.linalg.norm(n_hat) + 1e-12
+    n_hat /= n_len
+
+    t_hat = nipple.apex_frame[:, 1].astype(np.float64)
+    b_hat = nipple.apex_frame[:, 2].astype(np.float64)
+
+    # 3. Reconstruct tip ring and centre from centroid + normal
+    angles = np.linspace(0, 2 * np.pi, S, endpoint=False)
+    for i in range(S):
+        nipple.cage_verts[S + i] = (centroid
+            + h      * n_hat
+            + r_tip  * np.cos(angles[i]) * t_hat
+            + r_tip  * np.sin(angles[i]) * b_hat).astype(np.float32)
+    nipple.cage_verts[2 * S] = (centroid + (h + r_tip * 0.2) * n_hat).astype(np.float32)
+
+
+def _update_nipples():
+    """Read skin-shell positions from simulation, update nipple hi-res mesh."""
+    if _nipple_l is None:
+        return
+    all_verts = torso.skin_mesh.v_p.to_numpy().astype(np.float32)
+
+    # ── Resolve cage-base bindings ───────────────────────────────────────────
+    # If the nipple was bound to the outer skin shell use those live vertices;
+    # otherwise fall back to the breast flesh vertices (legacy behaviour).
+    if (_skin_outer_anchor_verts is not None
+            and torso._skin_outer_vert_offset is not None):
+        _skin_outer_n     = torso.n_skin_verts - torso.n_skin_inner_verts
+        _skin_outer_start = torso._skin_outer_vert_offset
+        anchor_verts_live = all_verts[_skin_outer_start : _skin_outer_start + _skin_outer_n]
+        anchor_faces_live = torso._skin_outer_faces_np
+    else:
+        # Fallback: breast flesh
+        n_l = torso.n_left_verts
+        n_r = torso.n_right_verts
+        anchor_verts_live = None   # signals per-nipple split below
+        anchor_faces_live = None
+
+    if anchor_verts_live is not None:
+        # Both nipples share the same skin-shell anchor mesh
+        _update_nipple_cage_from_breast(_nipple_l, anchor_verts_live, anchor_faces_live)
+        _update_nipple_cage_from_breast(_nipple_r, anchor_verts_live, anchor_faces_live)
+    else:
+        n_l = torso.n_left_verts
+        n_r = torso.n_right_verts
+        _update_nipple_cage_from_breast(_nipple_l, all_verts[:n_l],
+                                        torso._breast_l_faces_np)
+        _update_nipple_cage_from_breast(_nipple_r, all_verts[n_l:n_l + n_r],
+                                        torso._breast_r_faces_np)
+
+    _nipple_l.hires_verts[:] = eval_hires_positions(
+        _nipple_l.cage_verts, _nipple_l.cage_tets,
+        _nipple_l.hires_tet_idx, _nipple_l.hires_bary)
+    _nipple_l_vp.from_numpy(_nipple_l.hires_verts)
+
+    _nipple_r.hires_verts[:] = eval_hires_positions(
+        _nipple_r.cage_verts, _nipple_r.cage_tets,
+        _nipple_r.hires_tet_idx, _nipple_r.hires_bary)
+    _nipple_r_vp.from_numpy(_nipple_r.hires_verts)
+
 
 # ── Main loop ─────────────────────────────────────────────────────────────────
 import time as _time
@@ -348,5 +642,8 @@ while tirender.window.running:
                 torso.xpbd.update_cons()
             torso.xpbd.update_vel_pinned(torso.skin_mesh.v_invm)
         sim['frame'] += 1
+
+    # Update nipple hi-res mesh to follow breast apex each frame
+    _update_nipples()
 
     tirender.render()

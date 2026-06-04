@@ -25,6 +25,38 @@ Usage
     # skin_tex.uvs        – (V_new, 2) float32 UV coords
     # skin_tex.indices    – (F, 3) int32 remapped face indices
     # skin_tex.vmapping   – (V_new,) int32  new→old vertex map
+
+──────────────────────────────────────────────────────────────────────────────
+COLOR-SPACE CONTRACT  (read this before touching any color value)
+──────────────────────────────────────────────────────────────────────────────
+All intermediate float arrays and Python-level color tuples/constants in this
+file are in LINEAR light space (physical units, no gamma curve applied).
+
+APPS HUNGARIAN NAMING CONVENTION used throughout this file:
+  lin_f       → float32 ndarray in [0,1], LINEAR space   (intermediate work)
+  srgb_u8     → uint8  ndarray in [0,255], sRGB-ENCODED  → upload colorspace="srgb"
+  lin_u8      → uint8  ndarray in [0,255], LINEAR space  → upload colorspace="physical"
+  _LIN suffix → module-level color constant in LINEAR space
+
+TEXTURE UPLOAD RULES:
+  • COLOR / EMISSIVE maps (albedo, SSS glow):
+      – Stored as ``*_lin_f`` during computation.
+      – Encoded with ``lin_f_to_srgb_u8()`` → ``*_srgb_u8`` uint8.
+      – Uploaded via ``np_to_texture(arr, colorspace="srgb")``  (the DEFAULT).
+      – pygfx shader decodes sRGB→linear, cancelling the encode.
+      – Shader ultimately sees the original linear values.  ✓
+  • DATA / NON-COLOR maps (normals, roughness, AO, height, thickness):
+      – Stored as ``*_lin_f`` during computation.
+      – Quantised with ``lin_f_to_lin_u8()`` → ``*_lin_u8`` uint8 (NO gamma).
+      – Uploaded via ``np_to_texture(arr, colorspace="physical")``.
+      – Shader sees raw stored values — no sRGB decode step.  ✓
+
+PYGFX MATERIAL COLOR UNIFORMS:
+  ``color``, ``emissive``, ``sheen_color_lin``, light ``color`` etc. on
+  pygfx materials accept LINEAR RGB tuples — do NOT pass sRGB values here.
+  All such tuples in this codebase are named with the ``_lin`` suffix or
+  annotated with ``# linear RGB`` to make this explicit.
+──────────────────────────────────────────────────────────────────────────────
 """
 from __future__ import annotations
 
@@ -38,7 +70,13 @@ import pygfx
 from scipy.ndimage import gaussian_filter
 
 from PBD_Taichi.utils.tex_utils import (
-    float01_to_u8, linear_to_srgb_u8, np_to_texture,
+    # lin_f_to_lin_u8  : linear float [0,1] → linear uint8 [0,255]  (no gamma)
+    #                     → upload with colorspace="physical"
+    # lin_f_to_srgb_u8 : linear float [0,1] → sRGB-encoded uint8 [0,255]
+    #                     → upload with colorspace="srgb" (DEFAULT)
+    lin_f_to_lin_u8, lin_f_to_srgb_u8, np_to_texture,
+    # Legacy aliases kept for any helpers below that haven't been updated yet:
+    float01_to_u8, linear_to_srgb_u8,
 )
 
 
@@ -56,13 +94,16 @@ class SkinTextures:
     vmapping: np.ndarray   # (V_new,) int32      — UV-vertex → original vertex
 
     # ── Raw numpy maps (uint8; also usable for save / debug) ──────────────
-    albedo_np:    np.ndarray   # (H, W, 4) RGBA  sRGB-encoded
-    normal_np:    np.ndarray   # (H, W, 4) RGBA  linear
-    roughness_np: np.ndarray   # (H, W, 3) RGB   linear; roughness in G channel
-    ao_np:        np.ndarray   # (H, W, 1) linear
-    height_np:    np.ndarray   # (H, W, 1) linear
-    emissive_np:  np.ndarray   # (H, W, 4) RGBA  sRGB-encoded
-    thickness_np: np.ndarray   # (H, W, 1) linear; 0=thick, 1=thin (Phase 2)
+    # Naming convention (Apps Hungarian):
+    #   *_srgb_u8  →  sRGB-encoded uint8  — uploaded with colorspace="srgb"
+    #   *_lin_u8   →  linear uint8        — uploaded with colorspace="physical"
+    albedo_srgb_u8:    np.ndarray   # (H, W, 4) RGBA  **sRGB-encoded**  ← NOT linear!
+    normal_lin_u8:     np.ndarray   # (H, W, 4) RGBA  linear tangent-space
+    roughness_lin_u8:  np.ndarray   # (H, W, 3) RGB   linear; roughness in G channel
+    ao_lin_u8:         np.ndarray   # (H, W, 1) linear
+    height_lin_u8:     np.ndarray   # (H, W, 1) linear
+    emissive_srgb_u8:  np.ndarray   # (H, W, 4) RGBA  **sRGB-encoded**  ← NOT linear!
+    thickness_lin_u8:  np.ndarray   # (H, W, 1) linear; 0=thick, 1=thin (Phase 2)
 
     # ── pygfx textures ─────────────────────────────────────────────────────
     albedo_tex:    pygfx.Texture
@@ -73,7 +114,7 @@ class SkinTextures:
     thickness_tex: pygfx.Texture   # Phase 2 — thin=1/thick=0
 
     # ── pre-wired PBR material ─────────────────────────────────────────────
-    material: pygfx.MeshStandardMaterial
+    material: pygfx.MeshPhysicalMaterial   # Phase 4+5: clearcoat + sheen
 
     def save(self, directory: str, prefix: str = "skin") -> None:
         """Write all maps as PNG files into *directory*."""
@@ -91,13 +132,13 @@ class SkinTextures:
                 Image.fromarray(arr, mode="RGBA").save(path)
             print(f"  saved {path}")
 
-        _save(self.albedo_np,    "albedo")
-        _save(self.normal_np[:, :, :3],   "normal")
-        _save(self.roughness_np[:, :, 1:2], "roughness")  # G channel = roughness values
-        _save(self.ao_np,        "ao")
-        _save(self.height_np,    "height")
-        _save(self.emissive_np,  "emissive")
-        _save(self.thickness_np, "thickness")
+        _save(self.albedo_srgb_u8,    "albedo")
+        _save(self.normal_lin_u8[:, :, :3],   "normal")
+        _save(self.roughness_lin_u8[:, :, 1:2], "roughness")  # G channel = roughness values
+        _save(self.ao_lin_u8,        "ao")
+        _save(self.height_lin_u8,    "height")
+        _save(self.emissive_srgb_u8,  "emissive")
+        _save(self.thickness_lin_u8, "thickness")
 
     # ------------------------------------------------------------------
     def save_with_overlay(self, directory: str, prefix: str = "skin",
@@ -121,13 +162,13 @@ class SkinTextures:
             directory, prefix,
             uvs=self.uvs, indices=self.indices,
             maps=[
-                (self.albedo_np,                  "albedo"),
-                (self.normal_np[:, :, :3],         "normal"),
-                (self.roughness_np[:, :, 1:2],     "roughness"),
-                (self.ao_np,                       "ao"),
-                (self.height_np,                   "height"),
-                (self.emissive_np,                 "emissive"),
-                (self.thickness_np,                "thickness"),
+                (self.albedo_srgb_u8,                  "albedo"),
+                (self.normal_lin_u8[:, :, :3],         "normal"),
+                (self.roughness_lin_u8[:, :, 1:2],     "roughness"),
+                (self.ao_lin_u8,                       "ao"),
+                (self.height_lin_u8,                   "height"),
+                (self.emissive_srgb_u8,                "emissive"),
+                (self.thickness_lin_u8,                "thickness"),
             ],
             verbose=True,
             line_color=line_color,
@@ -152,11 +193,21 @@ def generate_skin_textures(
     dewy_intensity: float = 0.10,            # roughness reduction in sebum patches
     emissive_intensity: float = 0.15,        # SSS glow multiplier in material
     normal_strength: float = 0.45,           # height→normal bump amplitude (0=flat, 1=strong)
-    # ── Phase 1b: epidermis/dermis two-layer colour model ────────────────
-    melanin_amount: float = 0.08,            # 0=very pale, 1=dark (melanin in epidermis)
-    haemo_amount: float = 0.55,              # 0=anaemic, 1=flushed (haemoglobin in dermis)
+    # ── Phase 1b/6: epidermis/dermis spectral two-layer colour model ─────
+    melanin_amount: float = 0.08,            # 0=very pale (albino), 1=very dark
+    haemo_amount: float = 0.55,              # 0=anaemic/bloodless, 1=very flushed
+    oxygenation: float = 1.0,               # Phase 6: 0=deoxy (cyanotic), 1=oxygenated (healthy)
     # ── Phase 1c: micro-detail normal ────────────────────────────────────
     detail_normal_strength: float = 0.25,   # 0=off, 1=strong fine-wrinkle detail
+    # ── Phase 4: dual-lobe specular (clearcoat = oil/sebum layer) ────────
+    clearcoat: float = 0.25,                # 0=off, 1=full clearcoat (smooth oil film)
+    clearcoat_roughness: float = 0.08,      # roughness of the clearcoat layer
+    # ── Phase 5: peach-fuzz / sheen ──────────────────────────────────────
+    sheen: float = 0.20,                    # 0=off, 1=full sheen (fine surface hair)
+    sheen_roughness: float = 0.50,          # roughness of the sheen lobe
+    # ⚠ LINEAR RGB — pygfx MeshPhysicalMaterial.sheen_color expects linear,
+    #   NOT sRGB.  Warm peach-fuzz tint; do not gamma-correct this value.
+    sheen_color_lin: tuple = (0.95, 0.85, 0.78),  # linear RGB peach-fuzz tint
     # ── optional inputs ──────────────────────────────────────────────────
     thickness_per_vertex: Optional[np.ndarray] = None,  # (V,) — shell thickness (Phase 2)
     sun_dir: Optional[np.ndarray] = None,               # (3,) — sun direction
@@ -213,45 +264,46 @@ def generate_skin_textures(
 
     # ── 3. Height map ────────────────────────────────────────────────────────
     t0 = time.time()
-    height_f = _gen_height(world_pos, tangent_map, bitan_map, mp,
+    height_lin_f = _gen_height(world_pos, tangent_map, bitan_map, mp,
                            pore_cell_size, H, W, rng)
     if verbose:
         print(f"  [skin_tex] height    {time.time()-t0:.1f}s")
 
     # ── 4. Normal map ────────────────────────────────────────────────────────
     t0 = time.time()
-    normal_f  = _gen_normal_from_height(height_f, mp, normal_strength)
+    normal_lin_f  = _gen_normal_from_height(height_lin_f, mp, normal_strength)
     if verbose:
         print(f"  [skin_tex] normal    {time.time()-t0:.1f}s")
 
     # ── 4b. Detail normal (Phase 1c) ─────────────────────────────────────────
     if detail_normal_strength > 0.0:
         t0 = time.time()
-        normal_f = _add_detail_normal(normal_f, mp, detail_normal_strength,
+        normal_lin_f = _add_detail_normal(normal_lin_f, mp, detail_normal_strength,
                                       H, W, rng)
         if verbose:
             print(f"  [skin_tex] detail nrm{time.time()-t0:.1f}s")
 
     # ── 5. Albedo (Phase 1b: two-layer epidermis/dermis model) ───────────────
     t0 = time.time()
-    albedo_f  = _gen_albedo(world_pos, world_nrm, tangent_map, bitan_map,
-                             mp, pore_cell_size, height_f,
+    albedo_lin_f  = _gen_albedo(world_pos, world_nrm, tangent_map, bitan_map,
+                             mp, pore_cell_size, height_lin_f,
                              freckle_density, sun_dir,
                              melanin_amount, haemo_amount,
-                             H, W, rng)
+                             H, W, rng,
+                             oxygenation=oxygenation)
     if verbose:
         print(f"  [skin_tex] albedo    {time.time()-t0:.1f}s")
 
     # ── 6. Roughness ─────────────────────────────────────────────────────────
     t0 = time.time()
-    rough_f   = _gen_roughness(height_f, mp, base_roughness, dewy_intensity,
+    rough_lin_f   = _gen_roughness(height_lin_f, mp, base_roughness, dewy_intensity,
                                H, W, rng)
     if verbose:
         print(f"  [skin_tex] roughness {time.time()-t0:.1f}s")
 
     # ── 7. AO ────────────────────────────────────────────────────────────────
     t0 = time.time()
-    ao_f      = _gen_ao(height_f, mp)
+    ao_lin_f      = _gen_ao(height_lin_f, mp)
     if verbose:
         print(f"  [skin_tex] ao        {time.time()-t0:.1f}s")
 
@@ -268,7 +320,7 @@ def generate_skin_textures(
     else:
         thickness_map = None
 
-    emissive_f = _gen_emissive(world_pos, mp, thickness_map, H, W, rng)
+    emissive_lin_f = _gen_emissive(world_pos, mp, thickness_map, H, W, rng)
     if verbose:
         print(f"  [skin_tex] emissive  {time.time()-t0:.1f}s")
 
@@ -295,76 +347,77 @@ def generate_skin_textures(
         out[fill] = arr[nearest_row[fill], nearest_col[fill]]
         return out
 
-    albedo_f   = _dilate(albedo_f)
-    normal_f   = _dilate(normal_f)
-    rough_f    = _dilate(rough_f[:, :, np.newaxis])[:, :, 0]
-    ao_f       = _dilate(ao_f[:, :, np.newaxis])[:, :, 0]
-    height_f   = _dilate(height_f[:, :, np.newaxis])[:, :, 0]
-    emissive_f = _dilate(emissive_f)
+    albedo_lin_f   = _dilate(albedo_lin_f)
+    normal_lin_f   = _dilate(normal_lin_f)
+    rough_lin_f    = _dilate(rough_lin_f[:, :, np.newaxis])[:, :, 0]
+    ao_lin_f       = _dilate(ao_lin_f[:, :, np.newaxis])[:, :, 0]
+    height_lin_f   = _dilate(height_lin_f[:, :, np.newaxis])[:, :, 0]
+    emissive_lin_f = _dilate(emissive_lin_f)
     if thickness_map is not None:
-        thickness_f = _dilate(thickness_map[:, :, np.newaxis])[:, :, 0]
+        thickness_lin_f = _dilate(thickness_map[:, :, np.newaxis])[:, :, 0]
     else:
-        thickness_f = np.zeros((H, W), np.float32)   # uniform thick → no extra SSS
+        thickness_lin_f = np.zeros((H, W), np.float32)   # uniform thick → no extra SSS
 
     # ── 10. Encode to uint8 ───────────────────────────────────────────────────
-    # Colour/emissive maps: sRGB-encode (gamma compress) before storing as uint8.
-    # pygfx decodes textures from sRGB to linear in the shader by default
-    # (colorspace="srgb").  Without this encode the shader would decode our
-    # already-linear values a second time, producing very saturated / dark colours.
-    def rgba_u8_srgb(rgb_f: np.ndarray, alpha: float = 1.0) -> np.ndarray:
-        """Linear float [0,1] → sRGB-encoded RGBA uint8."""
-        H_, W_, C = rgb_f.shape
+    # COLOR maps (albedo, emissive):
+    #   lin_f → sRGB-encode → srgb_u8 → upload colorspace="srgb"
+    #   pygfx shader decodes sRGB→linear, recovering the original lin values.
+    # DATA maps (normal, roughness, AO, height, thickness):
+    #   lin_f → straight quantise (no gamma) → lin_u8 → upload colorspace="physical"
+    #   shader sees raw stored values unchanged.
+    def rgba_srgb_u8(rgb_lin_f: np.ndarray, alpha: float = 1.0) -> np.ndarray:
+        """Linear float RGB [0,1] → sRGB-encoded RGBA uint8.
+
+        ⚠ OUTPUT IS sRGB-ENCODED — upload with colorspace="srgb" ONLY.
+        """
+        H_, W_, C = rgb_lin_f.shape
         alpha_ch = np.full((H_, W_, 1), alpha * 255, dtype=np.uint8)
-        return np.concatenate([linear_to_srgb_u8(rgb_f), alpha_ch], axis=2)
+        return np.concatenate([lin_f_to_srgb_u8(rgb_lin_f), alpha_ch], axis=2)
 
-    # Normal / roughness / AO: raw linear data — uploaded with colorspace="physical"
-    # so pygfx does NOT apply sRGB decoding.
-    def linear_u8(arr_f: np.ndarray) -> np.ndarray:
-        """Linear float [0,1] → uint8 (no gamma)."""
-        return float01_to_u8(arr_f)
-
-    albedo_np    = rgba_u8_srgb(albedo_f)
-    # Normal map is linear data (encoded [-1,1]→[0,1] but not sRGB)
-    normal_np    = np.concatenate(
-        [linear_u8(normal_f),
-         np.full((*normal_f.shape[:2], 1), 255, dtype=np.uint8)],
+    albedo_srgb_u8    = rgba_srgb_u8(albedo_lin_f)   # ← sRGB-encoded
+    # Normal map: tangent-space vectors encoded [-1,1]→[0,1]; NOT a color →
+    # store as LINEAR uint8 (no gamma), upload with colorspace="physical".
+    normal_lin_u8    = np.concatenate(
+        [lin_f_to_lin_u8(normal_lin_f),
+         np.full((*normal_lin_f.shape[:2], 1), 255, dtype=np.uint8)],
         axis=2,
     )
     # Roughness: glTF/pygfx PBR convention — roughness in GREEN channel.
     # pygfx shader reads: roughness_factor *= textureSample(...).g
     # R=0 (unused), G=roughness, B=0 (metalness=0 for skin).
-    _rough_u8 = linear_u8(rough_f)
-    roughness_np = np.stack([
-        np.zeros_like(_rough_u8),   # R — unused
-        _rough_u8,                  # G — roughness (pygfx reads this channel)
-        np.zeros_like(_rough_u8),   # B — metalness (0 = dielectric / skin)
-    ], axis=2)                      # (H, W, 3) uint8
-    ao_np        = linear_u8(ao_f[..., np.newaxis])
-    height_np    = linear_u8(height_f[..., np.newaxis])
-    emissive_np  = rgba_u8_srgb(emissive_f)
-    thickness_np = linear_u8(thickness_f[..., np.newaxis])   # Phase 2
+    _rough_lin_u8 = lin_f_to_lin_u8(rough_lin_f)
+    roughness_lin_u8 = np.stack([
+        np.zeros_like(_rough_lin_u8),   # R — unused
+        _rough_lin_u8,                  # G — roughness (pygfx reads this channel)
+        np.zeros_like(_rough_lin_u8),   # B — metalness (0 = dielectric / skin)
+    ], axis=2)                          # (H, W, 3) uint8  ← LINEAR (no gamma)
+    ao_lin_u8        = lin_f_to_lin_u8(ao_lin_f[..., np.newaxis])
+    height_lin_u8    = lin_f_to_lin_u8(height_lin_f[..., np.newaxis])
+    emissive_srgb_u8  = rgba_srgb_u8(emissive_lin_f)   # ← sRGB-encoded
+    thickness_lin_u8 = lin_f_to_lin_u8(thickness_lin_f[..., np.newaxis])  # Phase 2
 
     # ── 11. Upload textures ───────────────────────────────────────────────────
-    # Colour maps → sRGB colorspace (default); non-colour → physical (linear).
-    albedo_tex    = np_to_texture(albedo_np,    colorspace="srgb")
-    normal_tex    = np_to_texture(normal_np,    colorspace="physical")
-    roughness_tex = np_to_texture(roughness_np, colorspace="physical")
-    ao_tex        = np_to_texture(ao_np,        colorspace="physical")
-    emissive_tex  = np_to_texture(emissive_np,  colorspace="srgb")
-    thickness_tex = np_to_texture(thickness_np, colorspace="physical")  # Phase 2
+    # sRGB-encoded maps  → colorspace="srgb"      (shader decodes → linear)
+    # Linear data maps   → colorspace="physical"  (shader reads as-is)
+    albedo_tex    = np_to_texture(albedo_srgb_u8,    colorspace="srgb")
+    normal_tex    = np_to_texture(normal_lin_u8,     colorspace="physical")
+    roughness_tex = np_to_texture(roughness_lin_u8,  colorspace="physical")
+    ao_tex        = np_to_texture(ao_lin_u8,         colorspace="physical")
+    emissive_tex  = np_to_texture(emissive_srgb_u8,  colorspace="srgb")
+    thickness_tex = np_to_texture(thickness_lin_u8,  colorspace="physical")  # Phase 2
 
     # ── 12. Optional debug save ───────────────────────────────────────────────
     if debug_save_dir is not None:
         import os
         from PIL import Image as _PIL
         os.makedirs(debug_save_dir, exist_ok=True)
-        _PIL.fromarray(albedo_np[:,:,:3]).save(os.path.join(debug_save_dir, "skin_albedo.png"))
-        _PIL.fromarray(normal_np[:,:,:3]).save(os.path.join(debug_save_dir, "skin_normal.png"))
-        _PIL.fromarray(roughness_np[:,:,1]).save(os.path.join(debug_save_dir, "skin_roughness.png"))  # G ch
-        _PIL.fromarray(ao_np[:,:,0]).save(os.path.join(debug_save_dir, "skin_ao.png"))
-        _PIL.fromarray(height_np[:,:,0]).save(os.path.join(debug_save_dir, "skin_height.png"))
-        _PIL.fromarray(emissive_np[:,:,:3]).save(os.path.join(debug_save_dir, "skin_emissive.png"))
-        _PIL.fromarray(thickness_np[:,:,0]).save(os.path.join(debug_save_dir, "skin_thickness.png"))
+        _PIL.fromarray(albedo_srgb_u8[:,:,:3]).save(os.path.join(debug_save_dir, "skin_albedo.png"))
+        _PIL.fromarray(normal_lin_u8[:,:,:3]).save(os.path.join(debug_save_dir, "skin_normal.png"))
+        _PIL.fromarray(roughness_lin_u8[:,:,1]).save(os.path.join(debug_save_dir, "skin_roughness.png"))  # G ch
+        _PIL.fromarray(ao_lin_u8[:,:,0]).save(os.path.join(debug_save_dir, "skin_ao.png"))
+        _PIL.fromarray(height_lin_u8[:,:,0]).save(os.path.join(debug_save_dir, "skin_height.png"))
+        _PIL.fromarray(emissive_srgb_u8[:,:,:3]).save(os.path.join(debug_save_dir, "skin_emissive.png"))
+        _PIL.fromarray(thickness_lin_u8[:,:,0]).save(os.path.join(debug_save_dir, "skin_thickness.png"))
         if verbose:
             print(f"  [skin_tex] debug maps saved to {debug_save_dir}/")
         # Also save mesh-overlay versions for seam/coverage inspection
@@ -372,13 +425,13 @@ def generate_skin_textures(
             debug_save_dir, "skin",
             uvs=uvs, indices=uv_indices,
             maps=[
-                (albedo_np,              "albedo"),
-                (normal_np[:,:,:3],      "normal"),
-                (roughness_np[:,:,1:2],  "roughness"),
-                (ao_np,                  "ao"),
-                (height_np,              "height"),
-                (emissive_np,            "emissive"),
-                (thickness_np,           "thickness"),
+                (albedo_srgb_u8,              "albedo"),
+                (normal_lin_u8[:,:,:3],       "normal"),
+                (roughness_lin_u8[:,:,1:2],   "roughness"),
+                (ao_lin_u8,                   "ao"),
+                (height_lin_u8,               "height"),
+                (emissive_srgb_u8,            "emissive"),
+                (thickness_lin_u8,            "thickness"),
             ],
             verbose=verbose,
         )
@@ -389,22 +442,41 @@ def generate_skin_textures(
     def _atlas_map(tex, **kw):
         return pygfx.TextureMap(tex, wrap="clamp", **kw)
 
-    material = pygfx.MeshStandardMaterial(
-        # Albedo
+    # Phase 4 + 5: upgrade to MeshPhysicalMaterial which exposes
+    # clearcoat (dual-lobe specular) and sheen (peach-fuzz) lobes.
+    #
+    # ⚠ ALL color/emissive uniform values below are LINEAR RGB.
+    # pygfx material color uniforms do NOT go through sRGB decoding —
+    # they are used directly in the shader as linear light values.
+    material = pygfx.MeshPhysicalMaterial(
+        # ── Base layer (dermis + corneocyte micro-structure) ─────────────
         map=_atlas_map(albedo_tex),
-        color=(1.0, 1.0, 1.0),
-        # Geometry / surface
+        color=(1.0, 1.0, 1.0),           # linear RGB white multiplier
+        # Surface geometry
         normal_map=_atlas_map(normal_tex),
-        normal_scale=(normal_strength, normal_strength),   # baked intensity already calibrated
+        normal_scale=(normal_strength, normal_strength),
         roughness=1.0,           # map provides per-texel value
         roughness_map=_atlas_map(roughness_tex),
         metalness=0.0,           # skin is dielectric
         # AO
         ao_map=_atlas_map(ao_tex),
-        # SSS approximation via emissive
-        emissive=(1.0, 1.0, 1.0),
+        # SSS approximation via emissive (Phases 2 + 3)
+        emissive=(1.0, 1.0, 1.0),         # linear RGB white multiplier
         emissive_map=_atlas_map(emissive_tex),
         emissive_intensity=emissive_intensity,
+        # ── Phase 4: clearcoat = thin sebum/oil layer (sharp specular) ───
+        # The clearcoat lobe adds a second, smoother specular highlight on
+        # top of the base GGX lobe.  Low roughness → sharp, mirror-like
+        # oil-film sheen; strength ~0.2–0.4 for realistic skin.
+        clearcoat=float(clearcoat),
+        clearcoat_roughness=float(clearcoat_roughness),
+        # ── Phase 5: sheen = peach-fuzz / fine surface hair ──────────────
+        # Sheen is a retroreflective fabric-like lobe visible at grazing
+        # angles.  Warm color + moderate roughness models fine hair fuzz.
+        # sheen_color_lin: linear RGB — NOT sRGB.  pygfx uses it directly.
+        sheen=float(sheen),
+        sheen_roughness=float(sheen_roughness),
+        sheen_color=tuple(sheen_color_lin),  # ← linear RGB, see param docstring
         side="both",
     )
 
@@ -413,9 +485,9 @@ def generate_skin_textures(
 
     return SkinTextures(
         uvs=uvs, indices=uv_indices, vmapping=vmapping,
-        albedo_np=albedo_np, normal_np=normal_np,
-        roughness_np=roughness_np, ao_np=ao_np, height_np=height_np,
-        emissive_np=emissive_np, thickness_np=thickness_np,
+        albedo_srgb_u8=albedo_srgb_u8, normal_lin_u8=normal_lin_u8,
+        roughness_lin_u8=roughness_lin_u8, ao_lin_u8=ao_lin_u8, height_lin_u8=height_lin_u8,
+        emissive_srgb_u8=emissive_srgb_u8, thickness_lin_u8=thickness_lin_u8,
         albedo_tex=albedo_tex, normal_tex=normal_tex,
         roughness_tex=roughness_tex, ao_tex=ao_tex,
         emissive_tex=emissive_tex, thickness_tex=thickness_tex,
@@ -1298,64 +1370,118 @@ def _add_detail_normal(
 # ══════════════════════════════════════════════════════════════════════════════
 
 # ══════════════════════════════════════════════════════════════════════════════
-# Albedo — Phase 1b: epidermis/dermis two-layer model
+# Albedo — Phase 6: spectral Beer–Lambert two-layer model
 # ══════════════════════════════════════════════════════════════════════════════
 
-# Melanin spectral transmittance (linear RGB) — broad absorption, most in blue.
-# Represents the fraction of light that gets through the epidermal melanin layer.
-# Low values = more absorption (darker pigment).
-_MELANIN_LIN = np.array([0.82, 0.62, 0.28], np.float32)   # yellowish-brown
+# Effective absorption *depth* per unit concentration (R, G, B channels).
+# These encode how strongly each layer absorbs at ~650 nm (R), ~550 nm (G),
+# ~450 nm (B).  Values tuned so that the plausible concentration range
+# [0, 1] spans from near-white (albino) through healthy pale to deep-pigmented.
+#
+#   T(λ) = exp(−depth_λ × concentration)
+#
+# At concentration=0 → T=[1,1,1] (no pigment, pure white).
+# At concentration=1 → T=exp(−depth)  (maximum pigmentation).
 
-# Oxyhaemoglobin spectral transmittance (linear RGB) — strong in red, low in G/B.
-# Represents the dermal blood layer.  Very red: real oxyhemoglobin absorbs
-# blue (~415 nm Soret band) and green (~540/577 nm Q-bands) strongly.
-_HAEMO_LIN   = np.array([0.82, 0.20, 0.14], np.float32)   # red
+# Melanin (eumelanin) — yellowish-brown; absorbs blue >> green >> red.
+# Reproduces CIE-published melanin spectral shape (Bashkatov 2011 trend).
+#   conc=0.08 (pale) → T≈[0.89,0.82,0.70]  (barely tinted)
+#   conc=0.40 (medium brown) → T≈[0.55,0.37,0.16]
+#   conc=1.00 (very dark) → T≈[0.22,0.08,0.01]
+_MEL_DEPTH  = np.array([1.50, 2.50, 4.50], np.float32)
 
-# Freckle colour (warm brown — linear)
-_FRECKLE_COLOR = np.array([0.13, 0.06, 0.03], np.float32)
+# Oxyhaemoglobin — red blood; absorbs blue/green (Soret + Q-bands), not red.
+#   conc=0.55 (healthy) → T≈[0.85,0.52,0.46]
+#   conc=1.00 (very flushed) → T≈[0.74,0.30,0.25]
+_OXY_DEPTH  = np.array([0.30, 1.20, 1.40], np.float32)
 
-# Subtle blemish colour (rose/pink — linear)
-_BLEMISH_COLOR = np.array([0.60, 0.25, 0.22], np.float32)
+# Deoxyhaemoglobin — absorbs more in orange-red (cyanotic tint).
+#   Gives slightly bluish/cyanotic cast when oxygenation < 1.
+_DEOXY_DEPTH = np.array([0.85, 0.90, 0.50], np.float32)
+
+# Freckle colour (warm brown) — ⚠ LINEAR RGB, NOT sRGB
+_FRECKLE_COLOR_LIN = np.array([0.13, 0.06, 0.03], np.float32)
+
+# Subtle blemish colour (rose/pink) — ⚠ LINEAR RGB, NOT sRGB
+_BLEMISH_COLOR_LIN = np.array([0.60, 0.25, 0.22], np.float32)
+
+
+def spectral_skin_base_color(
+    melanin_amount:  float,
+    haemo_amount:    float,
+    oxygenation:     float = 1.0,
+) -> np.ndarray:
+    """Return the (3,) linear RGB base colour for the given skin parameters.
+
+    This is a physically motivated Beer–Lambert two-layer model:
+    * Epidermis (outer): melanin absorbs blue >> green >> red.
+    * Dermis (inner):    haemoglobin absorbs blue/green (Soret / Q-bands).
+    * Total reflectance: epidermis_T × dermis_T  (multiplicative Beer–Lambert).
+
+    Parameters
+    ----------
+    melanin_amount : float
+        0 = very pale (albino), 1 = very dark.  Typical healthy-pale value 0.08.
+    haemo_amount : float
+        0 = bloodless/anaemic, 1 = very flushed.  Typical healthy value 0.50.
+    oxygenation : float
+        0 = fully deoxygenated (cyanotic), 1 = fully oxygenated (healthy, default).
+
+    Returns
+    -------
+    np.ndarray
+        (3,) float32 linear RGB — multiply by 255 to preview as sRGB pixel.
+    """
+    mel_T   = np.exp(-_MEL_DEPTH  * float(melanin_amount))
+    oxy_T   = np.exp(-_OXY_DEPTH  * float(haemo_amount))
+    deoxy_T = np.exp(-_DEOXY_DEPTH * float(haemo_amount))
+    oxy     = float(np.clip(oxygenation, 0.0, 1.0))
+    hemo_T  = oxy * oxy_T + (1.0 - oxy) * deoxy_T
+    return (mel_T * hemo_T).astype(np.float32)
 
 
 def _two_layer_skin_base(
     melanin_amount: float,
     haemo_amount:   float,
+    oxygenation:    float,
     noise_var:      np.ndarray,   # (N,) float [0,1] — large-scale noise
     noise_mel:      np.ndarray,   # (N,) float [0,1] — melanin spatial variation
     noise_hae:      np.ndarray,   # (N,) float [0,1] — haemo spatial variation
 ) -> np.ndarray:
-    """Compute per-pixel (N, 3) linear RGB base colour using a Beer–Lambert
-    two-layer absorption model.
+    """Per-pixel (N, 3) linear RGB using Beer–Lambert spectral absorption.
 
-    Epidermis (outer): modulated by melanin concentration.
-    Dermis (inner):    modulated by haemoglobin concentration.
-    Final reflectance: epidermis * dermis  (multiplicative — Beer–Lambert).
+    Phase 6: replaces the old linear-lerp model with an exponential
+    transmittance model:
+        T_epi(λ) = exp(−_MEL_DEPTH_λ × mel_local)
+        T_derm(λ) = exp(−μ_hemo_λ × hae_local)
+        base(λ)  = T_epi(λ) × T_derm(λ)
 
-    Spatial variation is added by slightly perturbing each concentration per
-    pixel using independent noise maps, so the skin isn't perfectly uniform.
+    Spatial variation is applied by perturbing each concentration per pixel
+    via independent noise maps (±15% for melanin, ±10% for haemo).
     """
     N = len(noise_var)
 
-    # Per-pixel concentration (add ±15% spatial variation)
+    # Per-pixel concentration (add ±15% / ±10% spatial variation)
     mel_local = np.clip(melanin_amount * (1.0 + (noise_mel - 0.5) * 0.30), 0.0, 1.0)
     hae_local = np.clip(haemo_amount   * (1.0 + (noise_hae - 0.5) * 0.20), 0.0, 1.0)
 
-    # Epidermis layer: lerp(white, melanin_colour, mel_local)
-    epidermis = (1.0 - mel_local[:, np.newaxis]) * np.ones((N, 3), np.float32) \
-              +        mel_local[:, np.newaxis]  * _MELANIN_LIN   # (N, 3)
+    # --- Epidermis: Beer–Lambert melanin transmittance ---
+    # T_epi(λ) = exp(−depth_λ × mel_local)   shape (N, 3)
+    mel_T = np.exp(-_MEL_DEPTH[np.newaxis, :] * mel_local[:, np.newaxis])    # (N, 3)
 
-    # Dermis layer: lerp(white, haemo_colour, hae_local)
-    dermis    = (1.0 - hae_local[:, np.newaxis]) * np.ones((N, 3), np.float32) \
-              +        hae_local[:, np.newaxis]  * _HAEMO_LIN     # (N, 3)
+    # --- Dermis: Beer–Lambert haemoglobin transmittance ---
+    oxy   = float(np.clip(oxygenation, 0.0, 1.0))
+    oxy_T   = np.exp(-_OXY_DEPTH[np.newaxis, :] * hae_local[:, np.newaxis])  # (N, 3)
+    deoxy_T = np.exp(-_DEOXY_DEPTH[np.newaxis, :] * hae_local[:, np.newaxis])
+    hemo_T  = oxy * oxy_T + (1.0 - oxy) * deoxy_T                            # (N, 3)
 
-    # Multiplicative Beer–Lambert: light passes through epidermis then dermis
-    base = epidermis * dermis   # (N, 3)
+    # Multiplicative: light traverses epidermis then dermis
+    base = mel_T * hemo_T                                                      # (N, 3)
 
-    # Add a small brightness variation from the large-scale noise
+    # Small large-scale brightness variation
     base += (noise_var - 0.5)[:, np.newaxis] * 0.04   # ±2 % brightness
 
-    return base.astype(np.float32)
+    return base.clip(0.0, 1.0).astype(np.float32)
 
 
 def _gen_albedo(
@@ -1372,13 +1498,14 @@ def _gen_albedo(
     haemo_amount:   float,
     H: int, W: int,
     rng,
+    oxygenation: float = 1.0,   # Phase 6: 0=deoxy/cyanotic, 1=oxygenated/healthy
 ) -> np.ndarray:
-    """Layered albedo map (Phase 1b). Returns (H, W, 3) float [0, 1]."""
+    """Layered albedo map (Phase 6: spectral Beer–Lambert). Returns (H, W, 3) float [0, 1]."""
 
     # Compute a neutral base from the two-layer model for pre-fill
     # (single pixel, no spatial variation) for empty atlas regions
     _base_fill = _two_layer_skin_base(
-        melanin_amount, haemo_amount,
+        melanin_amount, haemo_amount, oxygenation,
         np.array([0.5]), np.array([0.5]), np.array([0.5]),
     )[0]
     albedo = np.tile(_base_fill, (H, W, 1)).astype(np.float32)
@@ -1396,9 +1523,9 @@ def _gen_albedo(
     mel_noise = _uv_smooth_noise(H, W, sigma_px=H * 0.040, rng=rng)  # ~40 mm blobs
     hae_noise = _uv_smooth_noise(H, W, sigma_px=H * 0.030, rng=rng)  # ~30 mm blobs
 
-    # ── Phase 1b: two-layer base colour ──────────────────────────────────────
+    # ── Phase 6: spectral Beer–Lambert two-layer base colour ─────────────────
     layer = _two_layer_skin_base(
-        melanin_amount, haemo_amount,
+        melanin_amount, haemo_amount, oxygenation,
         var_map[rows, cols],
         mel_noise[rows, cols],
         hae_noise[rows, cols],
@@ -1502,7 +1629,7 @@ def _apply_freckles(
         opacity   = rng.uniform(0.18, 0.42)
         # Slight colour variation between freckles
         brightness = rng.uniform(0.85, 1.15)
-        color = np.clip(_FRECKLE_COLOR * brightness, 0.0, 1.0)
+        color = np.clip(_FRECKLE_COLOR_LIN * brightness, 0.0, 1.0)
 
         # Bounding box
         r0 = max(0, int(sr - radius_px * 3))
@@ -1552,7 +1679,7 @@ def _apply_blemishes(
         mf = mask[r0:r1+1, c0:c1+1]
         albedo[r0:r1+1, c0:c1+1] = (
             albedo[r0:r1+1, c0:c1+1] * (1 - alpha[:, :, np.newaxis])
-            + _BLEMISH_COLOR * alpha[:, :, np.newaxis]
+            + _BLEMISH_COLOR_LIN * alpha[:, :, np.newaxis]
         ) * mf[:, :, np.newaxis] + albedo[r0:r1+1, c0:c1+1] * (~mf)[:, :, np.newaxis]
 
 
@@ -1623,8 +1750,8 @@ def _gen_ao(height: np.ndarray, mask: np.ndarray) -> np.ndarray:
 # Emissive (SSS approximation) — Phase 2: thickness-modulated
 # ══════════════════════════════════════════════════════════════════════════════
 
-# Warm-pink SSS colour — LINEAR value, sRGB-encoded before upload.
-_SSS_COLOR = np.array([0.70, 0.42, 0.42], np.float32)
+# Warm-pink SSS colour — ⚠ LINEAR RGB value; sRGB-encoded before upload.
+_SSS_COLOR_LIN = np.array([0.70, 0.42, 0.42], np.float32)
 
 
 def _bake_scalar_attr(
@@ -1718,9 +1845,9 @@ def _gen_emissive(
         thin = np.clip(thickness_map, 0.0, 1.0)
         # Base 0.40 everywhere, up to 1.0 in thin areas
         sss_strength = 0.40 + 0.60 * thin
-        emissive[mask] = _SSS_COLOR * (mod * sss_strength)[mask, np.newaxis]
+        emissive[mask] = _SSS_COLOR_LIN * (mod * sss_strength)[mask, np.newaxis]
     else:
-        emissive[mask] = _SSS_COLOR * mod[mask, np.newaxis]
+        emissive[mask] = _SSS_COLOR_LIN * mod[mask, np.newaxis]
 
     return np.clip(emissive, 0.0, 1.0)
 

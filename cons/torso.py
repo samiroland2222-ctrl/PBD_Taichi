@@ -100,6 +100,13 @@ class UnifiedTorso:
         self.n_left_tets   = len(t_l) // 4
         self.n_right_tets  = len(t_r) // 4
 
+        # Persist breast surface face arrays (needed by nipple geometry builder)
+        self._breast_l_faces_np = f_l.reshape(-1, 3).astype(np.int32)  # local indices
+        self._breast_r_faces_np = f_r.reshape(-1, 3).astype(np.int32)  # local indices
+        # Persist local base-vertex indices for robust nipple apex detection
+        self._breast_l_base_local_np = base_l.astype(np.int32)   # indices into v_l
+        self._breast_r_base_local_np = base_r.astype(np.int32)   # indices into v_r
+
         # ── 2. skin shell ─────────────────────────────────────────────────
         # Set arms to A-pose so the skin grid overlaps the arm capsule and
         # can be properly anchored/initialised against it.
@@ -195,6 +202,14 @@ class UnifiedTorso:
             self.n_skin_verts       = len(skin_v_np)
             self.n_skin_inner_verts = n_v_half   # inner ring: [0, n_v_half); outer: [n_v_half, …)
             self.n_skin_tets        = len(self.skin_shell.tets)
+
+            # ── Outer skin-shell data for nipple cage attachment ─────────────
+            # Faces are re-indexed to be 0-based into the outer-vertex sub-array
+            # (outer local verts run from n_v_half to len(skin_v_np)).
+            self._skin_outer_faces_np     = (skin_f_surf_outer - n_v_half).astype(np.int32)
+            # Global vertex index of the first outer skin-shell vertex in skin_mesh
+            self._skin_outer_vert_offset  = self.skin_offset + n_v_half
+
             merged_v, merged_t, merged_f = gtet.merge_numpy(
                 (v_l, t_l, f_l),
                 (v_r, t_r, f_r),
@@ -202,9 +217,11 @@ class UnifiedTorso:
             )
         else:
             skin_f_surf_outer = None
-            self.n_skin_verts       = 0
-            self.n_skin_inner_verts = 0
-            self.n_skin_tets        = 0
+            self.n_skin_verts           = 0
+            self.n_skin_inner_verts     = 0
+            self.n_skin_tets            = 0
+            self._skin_outer_faces_np   = None
+            self._skin_outer_vert_offset = None
             merged_v, merged_t, merged_f = gtet.merge_numpy(
                 (v_l, t_l, f_l),
                 (v_r, t_r, f_r),

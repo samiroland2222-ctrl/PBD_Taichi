@@ -496,6 +496,9 @@ class WgpuRenderer3D:
         self.show_surface_normals  = False
         self.surface_normals_scale = 0.01
 
+        # SSS post-process pass (set by setup_sss())
+        self._sss_pass = None
+
         # Persistent proxy (owns per-object pygfx caches)
         self._proxy = WgpuSceneProxy(self._scene)
 
@@ -542,6 +545,12 @@ class WgpuRenderer3D:
           - Ambient     : soft neutral, intensity 0.25
 
         Call once after construction, before the render loop.
+
+        ⚠ COLOR-SPACE NOTE:
+          pygfx light ``color`` tuples are LINEAR RGB — NOT sRGB.
+          Do NOT gamma-correct these values.  What you type is what the shader
+          multiplies against the BRDF, so (0.99, 0.95, 0.88) really is just
+          a slightly warm near-white in physical linear light units.
         """
         # Remove the default point light
         self._scene.remove(self._point_light)
@@ -549,21 +558,25 @@ class WgpuRenderer3D:
         # Ambient (replaces the existing one)
         self._scene.remove(self._scene.children[0])   # existing AmbientLight
         # Warm-neutral ambient — avoid cool/blue cast that makes skin look purple-grey
+        # linear RGB: (0.70, 0.65, 0.60) ← slightly warm grey
         self._scene.add(pygfx.AmbientLight(color=(0.70, 0.65, 0.60), intensity=0.30))
 
         # Key light — warm white, upper-left-front — follows camera
+        # linear RGB: (0.99, 0.95, 0.88) ← near-white with very slight warmth
         key = pygfx.DirectionalLight(color=(0.99, 0.95, 0.88), intensity=1.20)
         key.local.position = np.array([-0.6, 1.2, 1.0])
         key.look_at((0.0, 0.0, 0.0))
         self._scene.add(key)
 
         # Fill light — neutral (not blue), right-back
+        # linear RGB: (0.75, 0.72, 0.70) ← warm-neutral grey
         fill = pygfx.DirectionalLight(color=(0.75, 0.72, 0.70), intensity=0.25)
         fill.local.position = np.array([1.0, 0.3, -0.8])
         fill.look_at((0.0, 0.0, 0.0))
         self._scene.add(fill)
 
         # Rim/back — warm, catches SSS emissive
+        # linear RGB: (1.0, 0.88, 0.72) ← warm amber-ish
         rim = pygfx.DirectionalLight(color=(1.0, 0.88, 0.72), intensity=0.45)
         rim.local.position = np.array([0.8, 0.8, -1.2])
         rim.look_at((0.0, 0.0, 0.0))
@@ -572,8 +585,57 @@ class WgpuRenderer3D:
         self._skin_lights = [key, fill, rim]
 
 
+    # ------------------------------------------------------------------ SSS pass
 
-    # ------------------------------------------------------------------ imgui
+    def setup_sss(
+        self,
+        sss_strength : float = 0.28,
+        sigma_r      : float = 5.0,
+        sigma_g      : float = 3.0,
+        sigma_b      : float = 1.5,
+        highlight_lo : float = 0.55,
+        highlight_hi : float = 0.80,
+    ) -> "SkinSSSPass":
+        """Attach a screen-space SSS post-process to this renderer.
+
+        Creates a :class:`SkinSSSPass` and registers it via
+        ``renderer.effect_passes``.  Call once after
+        :meth:`setup_skin_lighting`; call again with different parameters to
+        replace the existing pass.
+
+        Parameters
+        ----------
+        sss_strength : float
+            Blend factor 0–1.  0 = no effect, 1 = fully blurred.
+        sigma_r / sigma_g / sigma_b : float
+            Gaussian blur radius in screen pixels for each colour channel.
+            Red should be largest (spreads most in real skin).
+        highlight_lo / highlight_hi : float
+            Luminance ramp: above *hi* specular highlights are not blurred.
+
+        Returns
+        -------
+        SkinSSSPass
+            The created pass, so the caller can tune parameters at runtime.
+        """
+        try:
+            from PBD_Taichi.utils.subsurface_pass import SkinSSSPass
+        except ImportError:
+            from utils.subsurface_pass import SkinSSSPass
+
+        sss = SkinSSSPass(
+            sss_strength = sss_strength,
+            sigma_r      = sigma_r,
+            sigma_g      = sigma_g,
+            sigma_b      = sigma_b,
+            highlight_lo = highlight_lo,
+            highlight_hi = highlight_hi,
+        )
+        self._sss_pass = sss
+        self.renderer.effect_passes = (sss,)
+        return sss
+
+
 
     def _init_imgui(self, fps: float) -> None:
         """Initialise hello_imgui ManualRender in a side-panel window."""
@@ -615,11 +677,11 @@ class WgpuRenderer3D:
                     fn(_gui)
                 imgui.end()
 
-            # ── Overlays panel (X-slice + surface normals) ────────────────
+            # ── Overlays panel (X-slice + surface normals + SSS) ─────────
             imgui.set_next_window_pos(
                 (0, 710), imgui.Cond_.first_use_ever)
             imgui.set_next_window_size(
-                (370, 210), imgui.Cond_.first_use_ever)
+                (370, 320), imgui.Cond_.first_use_ever)
             imgui.begin("Overlays")
 
             imgui.text("── X-Slice ──")
@@ -644,6 +706,28 @@ class WgpuRenderer3D:
                     "Normal scale", self.surface_normals_scale, 0.001, 0.1)
             else:
                 imgui.text("  (disabled)")
+
+            # ── SSS post-process ──────────────────────────────────────────
+            if self._sss_pass is not None:
+                imgui.separator()
+                imgui.text("── Screen-Space SSS ──")
+                sss = self._sss_pass
+                _c, sss.enabled = imgui.checkbox("SSS enabled", sss.enabled)
+                if sss.enabled:
+                    _c, _v = imgui.slider_float("SSS strength", sss.sss_strength, 0.0, 0.8)
+                    sss.sss_strength = _v
+                    _c, _v = imgui.slider_float("σ red (px)",  sss.sigma_r, 1.0, 20.0)
+                    sss.sigma_r = _v
+                    _c, _v = imgui.slider_float("σ green (px)", sss.sigma_g, 0.5, 15.0)
+                    sss.sigma_g = _v
+                    _c, _v = imgui.slider_float("σ blue (px)",  sss.sigma_b, 0.5, 10.0)
+                    sss.sigma_b = _v
+                    _c, _v = imgui.slider_float("Hilight lo", sss.highlight_lo, 0.0, 1.0)
+                    sss.highlight_lo = _v
+                    _c, _v = imgui.slider_float("Hilight hi", sss.highlight_hi, 0.0, 1.0)
+                    sss.highlight_hi = _v
+                else:
+                    imgui.text("  (disabled)")
 
             imgui.end()
 
