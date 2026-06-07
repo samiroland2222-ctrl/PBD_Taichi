@@ -58,12 +58,14 @@ from PBD_Taichi.utils.tex_utils import (
 # Public constants (tuneable)
 # ──────────────────────────────────────────────────────────────────────────────
 
-# Melanin boost factor for areola / nipple relative to the surrounding skin
-_AREOLA_MELANIN_BOOST = 3.0   # areola is ~3× darker in melanin
-_NIPPLE_MELANIN_BOOST = 5.0   # nipple centre is ~5× darker
+# Melanin boost factor for areola / nipple relative to the surrounding skin.
+# Tuned for fair/light skin (melanin_amount ≈ 0.03–0.05): keeps the areola a
+# soft dusty-rose rather than medium-brown, and the nipple a deeper rose-pink.
+_AREOLA_MELANIN_BOOST = 1.8   # areola: ~1.8× darker in melanin (subtle on fair skin)
+_NIPPLE_MELANIN_BOOST = 2.8   # nipple centre: ~2.8× darker
 
-# Haemoglobin boost (areola often slightly more flushed)
-_AREOLA_HAEMO_BOOST   = 1.3
+# Haemoglobin boost (areola is notably more pink/flushed than surrounding skin)
+_AREOLA_HAEMO_BOOST   = 1.8   # raised from 1.3 → warmer pink on light skin
 
 # Roughness values for areola / nipple regions (overrides skin roughness)
 _AREOLA_ROUGHNESS     = 0.72  # slightly rougher than surrounding skin (Montgomery glands)

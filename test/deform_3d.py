@@ -31,6 +31,13 @@ try:
 except ImportError:
     _NIPPLE_AVAILABLE = False
 
+# ── Breathing animation ───────────────────────────────────────────────────────
+try:
+    from PBD_Taichi.utils.breathing import BreathingController, BreathingParams
+    _BREATHING_AVAILABLE = True
+except ImportError:
+    _BREATHING_AVAILABLE = False
+
 ti.init(arch=ti.cpu, cpu_max_num_threads=1)
 
 # ── Ribcage mesh (static visual + optional skin anchor source) ────────────────
@@ -77,9 +84,9 @@ dt         = 1.0 / (fps * substep)
 ribcage_verts = ribcage_mesh.v_p.to_numpy()
 torso = UnifiedTorso(
     skel,
-    breast_height=0.08,
-    breast_radius=0.06,
-    breast_k=1.0,
+    breast_height=0.075,   # slightly shorter for a rounder, less conical profile
+    breast_radius=0.07,    # wider base → fuller lower pole
+    breast_k=2.0,          # >1 = bulges outward beyond hemisphere (natural round shape)
     breast_spread=0.6,
     breast_tilt=0.3,
     breast_target_tets=600,
@@ -162,6 +169,42 @@ if _NIPPLE_AVAILABLE:
         print(f"[nipple] WARNING: failed to build nipple geometry: {_e}")
         import traceback; traceback.print_exc()
         _nipple_l = _nipple_r = None
+
+# ── Nipple rebuild helper (called after breast reshape) ───────────────────────
+def _rebuild_nipples_from_torso(torso_inst=None):
+    """Rebuild nipple geometry from the current (post-rebuild) breast mesh."""
+    global _nipple_l, _nipple_r, _nipple_l_vp, _nipple_r_vp, _nipple_l_fi, _nipple_r_fi
+    if not _NIPPLE_AVAILABLE:
+        return
+    try:
+        _ref = torso.skin_mesh.v_p_ref.to_numpy()
+        _bl = _ref[:torso.n_left_verts].astype(np.float32)
+        _br = _ref[torso.n_left_verts:torso.n_left_verts + torso.n_right_verts].astype(np.float32)
+
+        _anc_v = _skin_outer_anchor_verts
+        _anc_f = _skin_outer_anchor_faces
+
+        nl, nr = make_nipple_pair(
+            _bl, torso._breast_l_faces_np,
+            _br, torso._breast_r_faces_np,
+            base_l_vertex_indices=torso._breast_l_base_local_np,
+            base_r_vertex_indices=torso._breast_r_base_local_np,
+            anchor_verts=_anc_v, anchor_faces=_anc_f,
+            n_sides=4, hires_segs=16, hires_rings=7,
+        )
+        _nipple_l = nl;  _nipple_r = nr
+
+        _nipple_l_vp.from_numpy(_nipple_l.hires_verts)
+        _nipple_r_vp.from_numpy(_nipple_r.hires_verts)
+        _nipple_l_fi.from_numpy(_nipple_l.hires_faces.flatten().astype(np.int32))
+        _nipple_r_fi.from_numpy(_nipple_r.hires_faces.flatten().astype(np.int32))
+        print("[nipple] rebuilt after breast reshape")
+    except Exception as _e:
+        print(f"[nipple] WARNING: rebuild after reshape failed: {_e}")
+        import traceback; traceback.print_exc()
+
+# Register the nipple rebuild callback with the torso
+torso._breast_rebuild_callbacks.append(_rebuild_nipples_from_torso)
 
 # ── Renderer ──────────────────────────────────────────────────────────────────
 tirender = renderer.TaichiRenderer3D("Deform 3D – Unified Torso",
@@ -264,6 +307,17 @@ skin_color = (0.85, 0.65, 0.55)
 # ── Scene render draws ────────────────────────────────────────────────────────
 tirender.add_scene_render_draw(skeleton_mesh.get_render_draw(color=(0.7, 0.7, 0.5), wireframe=False))
 tirender.add_scene_render_draw(ribcage_mesh.get_render_draw(color=(0.7, 0.7, 0.5), wireframe=False))
+
+# ── Breathing animation ───────────────────────────────────────────────────────
+_breath_ctrl = None
+if _BREATHING_AVAILABLE:
+    _breath_ctrl = BreathingController(BreathingParams(
+        rate_bpm=15.0,
+        chest_amplitude=0.008,
+        abdomen_amplitude=0.012,
+    ))
+    _breath_ctrl.snapshot_ribcage_rest(skel)
+    print("[breathing] controller ready")
 
 if _wgpu and _skin_tex is not None:
     # PBR skin draw: replaces the flat-color all-faces draw when PBR is active.
@@ -466,6 +520,36 @@ def gui_draw(gui):
             _nipple_r_vp.from_numpy(_nipple_r.hires_verts)
         gui.text(f"  {'flat/relaxed' if _nipple_firmness[0] < 0.1 else 'firm/erect' if _nipple_firmness[0] > 0.9 else 'transitioning'}  ({_nipple_firmness[0]:.2f})")
 
+    # ── Breathing ─────────────────────────────────────────────────────────────
+    if _breath_ctrl is not None:
+        gui.text("-- Breathing --")
+        _breath_ctrl.enabled = gui.checkbox("Breathing on", _breath_ctrl.enabled)
+        _breath_ctrl.params.rate_bpm = gui.slider_float(
+            "Rate (bpm)", _breath_ctrl.params.rate_bpm, 0.0, 40.0)
+        _breath_ctrl.params.chest_amplitude = gui.slider_float(
+            "Chest amp (mm)",
+            _breath_ctrl.params.chest_amplitude * 1000, 0.0, 25.0) / 1000.0
+        _breath_ctrl.params.abdomen_amplitude = gui.slider_float(
+            "Abdomen amp (mm)",
+            _breath_ctrl.params.abdomen_amplitude * 1000, 0.0, 30.0) / 1000.0
+        ph = _breath_ctrl.breath_phase(sim['frame'] / fps) if sim['frame'] > 0 else 0.0
+        stage = "inhale" if ph > 0.05 else "exhale"
+        gui.text(f"  {stage}  phase={ph:.2f}  "
+                 f"{_breath_ctrl.params.rate_bpm:.1f} bpm")
+
+    # ── Breast live reshape ───────────────────────────────────────────────────
+    gui.text("-- Breast shape (Rebuild to apply) --")
+    bp = torso._breast_build_params
+    bp['breast_height'] = gui.slider_float(
+        "Height (mm)", bp['breast_height'] * 1000, 20.0, 150.0) / 1000.0
+    bp['breast_radius'] = gui.slider_float(
+        "Radius (mm)", bp['breast_radius'] * 1000, 20.0, 120.0) / 1000.0
+    bp['breast_k']      = gui.slider_float("Shape k",   bp['breast_k'],      0.3, 3.0)
+    bp['breast_spread'] = gui.slider_float("Spread",     bp['breast_spread'],  0.1, 1.2)
+    bp['breast_tilt']   = gui.slider_float("Tilt",       bp['breast_tilt'],    0.0, 0.8)
+    if gui.button("Rebuild breasts"):
+        torso.rebuild_breasts()   # uses stored _breast_build_params
+
 tirender.add_gui_draw(gui_draw)
 
 # ── Simulation control ────────────────────────────────────────────────────────
@@ -508,8 +592,10 @@ def _update_nipple_cage_from_breast(nipple, breast_verts_current, breast_faces):
 
     Base ring verts (cage indices 0..S-1) are positioned via their
     BarycentricBindingDefinitions.  Tip ring + centre are reconstructed
-    from the current base centroid and the initial outward normal.
+    from the current base centroid and a live EMA-smoothed outward normal.
     """
+    _NORMAL_EMA_ALPHA = 0.20   # smoothing factor (higher = more responsive to breast shape)
+
     S = len(nipple.cage_bindings)  # == n_sides (4)
     h = float(_NIPPLE_H_RELAX + nipple.firmness * (_NIPPLE_H_FIRM  - _NIPPLE_H_RELAX))
     r_tip = float(_NIPPLE_R_TIP_RELAX + nipple.firmness * (_NIPPLE_R_TIP_FIRM - _NIPPLE_R_TIP_RELAX))
@@ -527,7 +613,6 @@ def _update_nipple_cage_from_breast(nipple, breast_verts_current, breast_faces):
     # 2. Estimate current outward normal from the updated base ring
     base_ring  = nipple.cage_verts[:S]              # (S, 3)
     centroid   = base_ring.mean(axis=0)             # (3,)
-    # Cross product of the two base-ring diagonals gives a good normal estimate
     if S >= 3:
         d1 = (base_ring[2] - base_ring[0]).astype(np.float64)
         d2 = (base_ring[3 % S] - base_ring[1 % S]).astype(np.float64)
@@ -540,18 +625,38 @@ def _update_nipple_cage_from_breast(nipple, breast_verts_current, breast_faces):
     else:
         est_n = nipple.apex_frame[:, 0].astype(np.float64)
 
-    # Blend estimated normal with the initial normal to resist flipping
-    init_n = nipple.apex_frame[:, 0].astype(np.float64)
-    if np.dot(est_n, init_n) < 0:
-        est_n = init_n           # fallback if base ring flipped (degenerate)
-    n_hat = (0.5 * est_n + 0.5 * init_n)
-    n_len = np.linalg.norm(n_hat) + 1e-12
-    n_hat /= n_len
+    # ── EMA smoothing of normal to prevent flickering ─────────────────────────
+    # Initialise EMA state on first call
+    if not hasattr(nipple, '_smooth_n'):
+        nipple._smooth_n = nipple.apex_frame[:, 0].astype(np.float64).copy()
 
+    prev_n = nipple._smooth_n
+    # Guard against degenerate flips (prefer continuity with previous frame)
+    if np.dot(est_n, prev_n) < 0:
+        est_n = -est_n
+    smooth_n = _NORMAL_EMA_ALPHA * est_n + (1.0 - _NORMAL_EMA_ALPHA) * prev_n
+    nlen = np.linalg.norm(smooth_n)
+    if nlen > 1e-9:
+        smooth_n /= nlen
+    else:
+        smooth_n = prev_n.copy()
+    nipple._smooth_n = smooth_n.copy()
+    n_hat = smooth_n
+
+    # ── Gram-Schmidt orthonormal frame from live n_hat ────────────────────────
     t_hat = nipple.apex_frame[:, 1].astype(np.float64)
-    b_hat = nipple.apex_frame[:, 2].astype(np.float64)
+    t_hat -= np.dot(t_hat, n_hat) * n_hat
+    t_norm = np.linalg.norm(t_hat)
+    if t_norm < 1e-8:
+        hint  = np.array([0.0, 1.0, 0.0]) if abs(n_hat[1]) < 0.9 else np.array([1.0, 0.0, 0.0])
+        t_hat = hint - np.dot(hint, n_hat) * n_hat
+        t_hat /= np.linalg.norm(t_hat) + 1e-12
+    else:
+        t_hat /= t_norm
+    b_hat = np.cross(n_hat, t_hat)
+    b_hat /= np.linalg.norm(b_hat) + 1e-12
 
-    # 3. Reconstruct tip ring and centre from centroid + normal
+    # 3. Reconstruct tip ring and centre from centroid + live normal
     angles = np.linspace(0, 2 * np.pi, S, endpoint=False)
     for i in range(S):
         nipple.cage_verts[S + i] = (centroid
@@ -615,8 +720,18 @@ while tirender.window.running:
     tirender.handle_input()
 
     # Update skeleton and kinematic skin anchors once per frame
+    # Breathing: apply chest expansion BEFORE skel.update() so ribcage
+    # positions are correct when kinematic springs are resolved.
+    # sim_time uses wall-clock frame count / fps so breathing rate is correct.
+    # (Using frame * dt would give 1/substep × real time, making breathing ~6× too slow.)
+    sim_time = sim['frame'] / fps
+    if _breath_ctrl is not None:
+        _breath_ctrl.apply_to_ribcage(skel, sim_time)
     skel.update()
     torso.update_kinematic_skin()
+    # Breathing: drive abdominal skin targets AFTER kinematic skin update
+    if _breath_ctrl is not None:
+        _breath_ctrl.apply_abdomen(torso, sim_time)
     if torso.ligaments_l:
         torso.ligaments_l.update_anchors(skel.get_fascia_left_surface_anchors_np())
         torso.ligaments_r.update_anchors(skel.get_fascia_right_surface_anchors_np())

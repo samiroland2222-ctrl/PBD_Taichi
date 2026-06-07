@@ -678,11 +678,43 @@ def refresh_hires(
 ) -> None:
     """Rebuild the hi-res mesh for the current firmness state and rebind to cage.
 
+    Anchors the new hi-res mesh to the **live cage centroid and live normal**
+    (not the stale build-time apex_world / apex_frame) so that firmness changes
+    during a running simulation always produce a mesh that is correctly aligned
+    with the current breast surface.
+
     Mutates ``nipple.hires_verts``, ``nipple.hires_faces``,
     ``nipple.hires_tet_idx``, ``nipple.hires_bary`` in-place.
     """
+    S = len(nipple.cage_bindings)   # n_sides
+
+    # ── Build live apex position from current cage base-ring centroid ─────────
+    live_centroid = nipple.cage_verts[:S].mean(axis=0).astype(np.float32)
+
+    # ── Use live smoothed normal if available; fall back to stored frame ──────
+    if hasattr(nipple, '_smooth_n'):
+        live_n = nipple._smooth_n.astype(np.float64)
+    else:
+        live_n = nipple.apex_frame[:, 0].astype(np.float64)
+
+    # Gram-Schmidt orthonormalise t_hat against live n_hat
+    t_hat = nipple.apex_frame[:, 1].astype(np.float64)
+    t_hat -= np.dot(t_hat, live_n) * live_n
+    t_norm = np.linalg.norm(t_hat)
+    if t_norm > 1e-8:
+        t_hat /= t_norm
+    else:
+        hint  = np.array([0.0, 1.0, 0.0]) if abs(live_n[1]) < 0.9 else np.array([1.0, 0.0, 0.0])
+        t_hat = hint - np.dot(hint, live_n) * live_n
+        t_hat /= np.linalg.norm(t_hat) + 1e-12
+
+    b_hat = np.cross(live_n, t_hat)
+    b_hat /= np.linalg.norm(b_hat) + 1e-12
+
+    live_frame = np.stack([live_n, t_hat, b_hat], axis=1).astype(np.float32)  # (3,3)
+
     new_verts, new_faces = build_nipple_hires(
-        nipple.apex_world, nipple.apex_frame,
+        live_centroid, live_frame,
         areola_radius=areola_radius,
         nipple_radius=nipple_radius,
         h_tip=h_tip,
@@ -751,15 +783,48 @@ def make_nipple(
 
     anchor = AnchorType.BREAST_L if side == 'left' else AnchorType.BREAST_R
 
-    # 1. Apex — always detected on the breast flesh mesh with base indices
-    apex_pos, apex_frame = find_apex_frame(bv, bf, base_vertex_indices=base_vertex_indices)
+    # 1. Apex detection
+    # Always detect on the breast flesh first — gives us the correct protrusion direction
+    # even when the skin shell has low resolution near the tip.
+    flesh_apex, apex_frame = find_apex_frame(bv, bf, base_vertex_indices=base_vertex_indices)
+
+    if anchor_verts is not None and anchor_faces is not None:
+        # The nipple must sit on the OUTER skin-shell surface, which is ~skin_thickness
+        # further outward than the breast flesh apex.  Placing the cage at the flesh apex
+        # leaves it floating inside the mesh with ~14-20 mm binding distances.
+        #
+        # Fix: among all outer-skin-shell vertices within (2 × breast_radius) of the flesh
+        # apex, pick the one furthest along the breast protrusion direction n̂.  This is the
+        # skin surface apex in the breast region.
+        av_arr = np.asarray(anchor_verts, dtype=np.float32)
+        n_hat  = apex_frame[:, 0].astype(np.float64)   # breast outward normal
+
+        breast_r_est = float(
+            np.linalg.norm(bv.astype(np.float64) - bv.mean(axis=0), axis=1).max()
+        ) * 2.0   # generous search radius
+        dists_to_flesh = np.linalg.norm(av_arr - flesh_apex, axis=1)
+        near_mask = dists_to_flesh < breast_r_est
+        if near_mask.sum() >= 1:
+            near_idx  = np.where(near_mask)[0]
+            projs     = av_arr[near_idx].astype(np.float64) @ n_hat
+            best_vi   = near_idx[int(np.argmax(projs))]
+            apex_pos  = av_arr[best_vi].astype(np.float32)
+        else:
+            # Fallback: no outer-skin verts found nearby → use flesh apex
+            apex_pos = flesh_apex
+    else:
+        apex_pos = flesh_apex
 
     # 2. Cage — bind to skin shell if provided, else fall back to breast flesh
+    # Use areola_radius (not nipple_radius) as the cage base ring radius so that
+    # all hi-res areola disc verts fall INSIDE the cage tets and receive correct
+    # barycentric coordinates (using nipple_radius caused out-of-cage verts to get
+    # clamped bary coords, dragging the areola off the surface on erection).
     (cage_verts, cage_rest_flat, cage_rest_firm,
      cage_tets, cage_faces, bindings) = build_nipple_cage(
         apex_pos, apex_frame, bv, bf,
         anchor_type  = anchor,
-        r_base       = nipple_radius,
+        r_base       = areola_radius,   # was nipple_radius — expanded to cover full areola
         h_relax      = h_relax,
         h_firm       = h_firm,
         r_tip_relax  = r_tip_relax,

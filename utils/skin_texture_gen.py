@@ -1184,15 +1184,21 @@ def _gen_height(
     f1 = np.clip(f1 / 0.75, 0.0, 1.0)
     pore_h = f1 ** 1.2    # gentle bowl shape
 
-    # ── Micro-texture layer (fBm opensimplex) ────────────────────────────
-    freq_base = 1.0 / (pore_cell_size * 3.0)   # ~3× pore frequency
-    micro_raw = _fbm_opensimplex_3d(
-        wp_eval[:, 0] * freq_base,
-        wp_eval[:, 1] * freq_base,
-        wp_eval[:, 2] * freq_base,
-        octaves=3,
-    )
-    micro = (micro_raw * 0.5 + 0.5).astype(np.float32)   # [0, 1]
+    # ── Micro-texture layer (fast UV-space Gaussian noise) ───────────────
+    # Replace the slow 3-D fBm opensimplex (600 K Python calls ≈ 71 s) with
+    # two Gaussian-filtered white-noise layers evaluated in UV-space.
+    # This runs in O(H×W) via scipy gaussian_filter and completes in < 1 s.
+    _rng_state = np.random.RandomState(rng.randint(0, 2**31) if hasattr(rng, 'randint') else 42)
+    _noise_a = _rng_state.random_sample((H, W)).astype(np.float32)
+    _noise_b = _rng_state.random_sample((H, W)).astype(np.float32)
+    _micro_a = gaussian_filter(_noise_a, sigma=2.0)
+    _micro_b = gaussian_filter(_noise_b, sigma=0.8)
+    # Normalise each map to [0, 1]
+    def _norm01(a):
+        lo, hi = a.min(), a.max()
+        return (a - lo) / (hi - lo + 1e-8) if hi > lo else a
+    _micro_map = 0.6 * _norm01(_micro_a) + 0.4 * _norm01(_micro_b)   # (H, W) in [0,1]
+    micro = _micro_map[rows[idx_eval], cols[idx_eval]]
 
     # ── Combine at evaluation pixels ────────────────────────────────────
     h_eval = (0.25 * pore_h + 0.75 * micro).astype(np.float32)

@@ -78,6 +78,18 @@ class UnifiedTorso:
             dt = 1.0 / (fps * substep)
         self.dt = dt
 
+        # ── Store nominal breast build params for rebuild_breasts() ──────────
+        self._breast_build_params = dict(
+            breast_height = breast_height,
+            breast_radius = breast_radius,
+            breast_k      = breast_k,
+            breast_spread = breast_spread,
+            breast_tilt   = breast_tilt,
+            target_tets   = breast_target_tets,
+        )
+        # Callbacks fired at the end of rebuild_breasts() (e.g. nipple rebuild)
+        self._breast_rebuild_callbacks: list = []
+
         # ── 1. breast numpy data ──────────────────────────────────────────
         v_l, t_l, f_l, base_l, top_l = Breast.make_numpy(
             spread=_rand(breast_spread, 0.1),
@@ -138,6 +150,16 @@ class UnifiedTorso:
         _rc_faces_raw = (ribcage_faces_np if ribcage_faces_np is not None
                          else skeleton.get_ribcage_faces_np())
         self._ribcage_faces = np.asarray(_rc_faces_raw, dtype=np.int32).reshape(-1, 3)
+
+        # ── Store skin shell build params for rebuild_skin_shell() ────────────
+        # ribcage verts are the static reference (used as anatomy input to the
+        # Boolean merge that underlies the skin shell generation).
+        self._skin_ribcage_verts_np = (
+            np.asarray(ribcage_verts_np, dtype=np.float64)
+            if ribcage_verts_np is not None else np.zeros((0, 3), np.float64)
+        )
+        self._skin_target_n_tets = skin_target_n_tets
+        self._skin_thickness     = skin_thickness
 
         # ── 2b. Breast-base → fascia barycentric bindings ─────────────────
         # skeleton.update() was already called above, so fascia world verts are current.
@@ -444,6 +466,373 @@ class UnifiedTorso:
               f"bindings: {len(breast_b)} breast, "
               f"{len(self._kinematic_bindings)} kinematic, "
               f"{len(self._ribcage_bindings)} ribcage-spring")
+
+        # ── 9. Abdominal skin springs (for breathing animation) ───────────
+        self._init_abdomen_springs(dt)
+
+    # ------------------------------------------------------------------
+    # Abdominal springs (breathing animation)
+    # ------------------------------------------------------------------
+    def _init_abdomen_springs(self, dt: float) -> None:
+        """Detect lower-anterior outer skin verts and create abdomen springs.
+
+        Springs are initialised to zero rest-length offset (targets = rest
+        positions).  The ``BreathingController`` updates targets each frame.
+        """
+        self.abdomen_skin_springs    = None
+        self._abdomen_rest_positions = None
+        self._abdomen_weights        = None
+
+        if self._skin_outer_vert_offset is None or self.n_skin_verts == 0:
+            return
+
+        ref = self.skin_mesh.v_p_ref.to_numpy().astype(np.float32)
+
+        # Outer skin vert global indices and positions
+        n_outer  = self.n_skin_verts - self.n_skin_inner_verts
+        o_start  = self._skin_outer_vert_offset
+        outer_g  = np.arange(o_start, o_start + n_outer, dtype=np.int32)
+        outer_v  = ref[outer_g]   # (n_outer, 3)
+
+        # Breast vertical extent — use breast base verts (lowest attachment)
+        breast_ref = ref[:self.skin_offset]
+        breast_y_min = float(breast_ref[:, 1].min())
+
+        # Abdominal region: y below the breast base bottom, anterior half (z > median)
+        z_median = float(np.median(outer_v[:, 2]))
+        abdom_mask = ((outer_v[:, 1] < breast_y_min + 0.02)   # ≤ 2 cm above breast bottom
+                    & (outer_v[:, 2] > z_median - 0.01))       # anterior side
+
+        n_abd = int(abdom_mask.sum())
+        if n_abd == 0:
+            # Fallback: take the bottom third by y
+            order = np.argsort(outer_v[:, 1])
+            abdom_mask = np.zeros(n_outer, dtype=bool)
+            abdom_mask[order[:max(n_outer // 3, 1)]] = True
+            n_abd = int(abdom_mask.sum())
+
+        abd_global_idx = outer_g[abdom_mask]   # (n_abd,) global indices
+        abd_rest       = ref[abd_global_idx]   # (n_abd, 3)
+
+        # Weight: verts with lowest y (most inferior) get the most displacement
+        abd_y = abd_rest[:, 1]
+        y_min = float(abd_y.min())
+        y_rng = max(float(abd_y.max()) - y_min, 1e-6)
+        weights = np.clip(1.0 - (abd_y - y_min) / y_rng, 0.0, 1.0).astype(np.float32)
+
+        self._abdomen_rest_positions = abd_rest.copy()
+        self._abdomen_weights        = weights
+
+        self.abdomen_skin_springs = KinematicSkinSpringConstraint(
+            v_p         = self.skin_mesh.v_p,
+            v_invm      = self.skin_mesh.v_invm,
+            skin_idx_np = abd_global_idx,
+            init_target_np = abd_rest,
+            dt=dt, alpha=5e-3, pretension=1.0)
+        self.xpbd.add_cons(self.abdomen_skin_springs)
+        self.abdomen_skin_springs.init_rest_status()
+        print(f"[torso] abdomen springs: {n_abd} verts")
+
+    # ------------------------------------------------------------------
+    # Skin inner vert snap helper (called during rebuild)
+    # ------------------------------------------------------------------
+    def _snap_skin_inner_verts(self) -> None:
+        """Teleport skin inner verts to their current barycentric targets on the breast surface.
+
+        After a breast morph the breast surface verts have moved but the skin
+        inner verts are still at their old positions.  The ``skin_anchors``
+        (BaryBreastSkinConstraint) would then compute a large rest_length equal
+        to the current separation distance, freezing the skin away from the
+        breast.  Snapping the inner verts to the new breast surface before
+        ``init_rest_status()`` ensures rest_length ≈ 0, so the spring keeps the
+        skin tightly coupled to the new breast shape.
+        """
+        if self.skin_anchors.n == 0:
+            return
+
+        vp = self.skin_mesh.v_p.to_numpy().astype(np.float32)
+        k  = self.skin_anchors.n
+
+        skin_idx = self.skin_anchors.skin_idx.to_numpy()[:k]
+        tri_v0   = self.skin_anchors.tri_v0.to_numpy()[:k]
+        tri_v1   = self.skin_anchors.tri_v1.to_numpy()[:k]
+        tri_v2   = self.skin_anchors.tri_v2.to_numpy()[:k]
+        bu = self.skin_anchors.bary_u.to_numpy()[:k, None]
+        bv = self.skin_anchors.bary_v.to_numpy()[:k, None]
+        bw = self.skin_anchors.bary_w.to_numpy()[:k, None]
+
+        xt = bu * vp[tri_v0] + bv * vp[tri_v1] + bw * vp[tri_v2]   # (k, 3)
+        vp[skin_idx] = xt
+        self.skin_mesh.v_p.from_numpy(vp)
+
+    # ------------------------------------------------------------------
+    # Skin shell rebuild
+    # ------------------------------------------------------------------
+    def rebuild_skin_shell(self) -> bool:
+        """Fully regenerate the skin shell from the current breast rest geometry.
+
+        Called automatically by ``rebuild_breasts()``.  Can also be called
+        standalone whenever the anatomy changes.
+
+        Strategy
+        --------
+        * Calls ``generate_skin_shell()`` with the current breast rest verts and
+          stored ribcage geometry.
+        * If the new vertex and tet counts match the existing Taichi field sizes,
+          updates everything in-place (positions, tet topology, bindings,
+          constraint data, face rendering field).
+        * If counts differ, logs a warning and returns False without modifying
+          any state (simulation stays consistent with the old shell).
+
+        Returns
+        -------
+        True on success, False if vertex/tet counts mismatched.
+        """
+        from PBD_Taichi.geom import skin as skin_mod
+        import taichi as ti
+
+        if self.n_skin_tets == 0:
+            return True   # no skin shell — nothing to rebuild
+
+        print("[torso] rebuild_skin_shell: regenerating skin shell …")
+
+        # ── 1. Current breast rest geometry ──────────────────────────────────
+        all_ref = self.skin_mesh.v_p_ref.to_numpy().astype(np.float32)
+        n_l, n_r = self.n_left_verts, self.n_right_verts
+        bl_verts = all_ref[:n_l].astype(np.float64)
+        br_verts = all_ref[n_l:n_l + n_r].astype(np.float64)
+
+        # ── 2. Regenerate skin shell ──────────────────────────────────────────
+        new_shell, new_bindings = skin_mod.generate_skin_shell(
+            self.skeleton,
+            breast_l_verts=bl_verts,
+            breast_l_faces=self._breast_l_faces_np,
+            breast_r_verts=br_verts,
+            breast_r_faces=self._breast_r_faces_np,
+            ribcage_verts=self._skin_ribcage_verts_np if len(self._skin_ribcage_verts_np) > 0 else None,
+            ribcage_faces=self._ribcage_faces if len(self._ribcage_faces) > 0 else None,
+            target_n_tets=self._skin_target_n_tets,
+            thickness=self._skin_thickness,
+        )
+
+        new_skin_verts = new_shell.verts.astype(np.float32)
+        new_skin_tets  = new_shell.tets                      # (n_tets, 4) or flat?
+        n_new          = len(new_skin_verts)
+        n_new_half     = n_new // 2
+        n_new_tets     = len(new_shell.tets)
+        n_new_t_flat   = new_skin_tets.flatten()
+
+        # ── 3. Vertex / tet count guard ───────────────────────────────────────
+        if n_new != self.n_skin_verts:
+            print(f"[torso] rebuild_skin_shell: vertex count mismatch "
+                  f"(new={n_new}, old={self.n_skin_verts}) — skin NOT updated. "
+                  f"Restart the simulation to apply the new breast shape.")
+            return False
+        if n_new_tets != self.n_skin_tets:
+            print(f"[torso] rebuild_skin_shell: tet count mismatch "
+                  f"(new={n_new_tets}, old={self.n_skin_tets}) — skin NOT updated.")
+            return False
+
+        # ── 4. Update skin vertex positions in the unified mesh ───────────────
+        so = self.skin_offset
+
+        all_ref_new = all_ref.copy()
+        all_ref_new[so:so + self.n_skin_verts] = new_skin_verts
+        self.skin_mesh.v_p_ref.from_numpy(all_ref_new)
+
+        # Snap current positions to the new rest shape (kills any residual velocity
+        # in the skin shell; velocities are zeroed later by rebuild_breasts()).
+        all_vp = self.skin_mesh.v_p.to_numpy().astype(np.float32)
+        all_vp[so:so + self.n_skin_verts] = new_skin_verts
+        self.skin_mesh.v_p.from_numpy(all_vp)
+
+        # ── 5. Update tet connectivity (skin portion only) ────────────────────
+        # The skin tets are stored as a FLAT int32 array in _skin_t_field.
+        # Offset each vertex index by skin_offset to convert local → global.
+        n_bt = self.n_left_tets + self.n_right_tets
+        new_skin_t_global = (n_new_t_flat + so).astype(np.int32)
+        self._skin_t_field.from_numpy(new_skin_t_global)
+
+        # ── 6. Update barycentric bindings ────────────────────────────────────
+        self.barycentric_bindings = new_bindings
+
+        # ── 7. Patch BaryBreastSkinConstraint in-place ───────────────────────
+        breast_b = [b for b in new_bindings
+                    if b.anchor_type in (AnchorType.BREAST_L, AnchorType.BREAST_R)]
+        if self.skin_anchors.n == len(breast_b) and len(breast_b) > 0:
+            bl_faces = self._breast_l_faces_np
+            br_faces = self._breast_r_faces_np
+            _si, _v0, _v1, _v2, _uvw = [], [], [], [], []
+            for b in breast_b:
+                gi = so + b.skin_vertex_index
+                if b.anchor_type == AnchorType.BREAST_L:
+                    f3 = bl_faces[b.anchor_bary_face]; off = self.left_offset
+                else:
+                    f3 = br_faces[b.anchor_bary_face]; off = self.right_offset
+                _si.append(gi)
+                _v0.append(int(f3[0]) + off)
+                _v1.append(int(f3[1]) + off)
+                _v2.append(int(f3[2]) + off)
+                _uvw.append(b.anchor_bary_uvw)
+            uvw_arr = np.array(_uvw, dtype=np.float32).reshape(-1, 3)
+            self.skin_anchors.skin_idx.from_numpy(np.array(_si, dtype=np.int32))
+            self.skin_anchors.tri_v0.from_numpy(np.array(_v0, dtype=np.int32))
+            self.skin_anchors.tri_v1.from_numpy(np.array(_v1, dtype=np.int32))
+            self.skin_anchors.tri_v2.from_numpy(np.array(_v2, dtype=np.int32))
+            self.skin_anchors.bary_u.from_numpy(uvw_arr[:, 0])
+            self.skin_anchors.bary_v.from_numpy(uvw_arr[:, 1])
+            self.skin_anchors.bary_w.from_numpy(uvw_arr[:, 2])
+        elif len(breast_b) != self.skin_anchors.n:
+            print(f"[torso] rebuild_skin_shell: breast anchor count mismatch "
+                  f"(new={len(breast_b)}, old={self.skin_anchors.n}) — "
+                  f"skin_anchors indices NOT updated (spring targets stale).")
+
+        # ── 8. Update outer skin surface face field ───────────────────────────
+        new_surf_all   = new_shell.surface_faces()
+        outer_mask     = np.all(new_surf_all >= n_new_half, axis=1)
+        new_surf_outer = new_surf_all[outer_mask]
+        if len(new_surf_outer) == 0:
+            new_surf_outer = new_surf_all   # fallback
+
+        self._skin_outer_faces_np = (new_surf_outer - n_new_half).astype(np.int32)
+        global_skin_f = (new_surf_outer + so).flatten().astype(np.int32)
+
+        # Reallocate the Taichi face field if the surface face count changed.
+        if self.skin_f_i is not None and self.skin_f_i.shape[0] == len(global_skin_f):
+            self.skin_f_i.from_numpy(global_skin_f)
+        else:
+            self.skin_f_i = ti.field(dtype=ti.i32, shape=len(global_skin_f))
+            self.skin_f_i.from_numpy(global_skin_f)
+
+        # ── 9. Recompute masses and re-apply pins for the skin portion ────────
+        self.skin_mesh.reset_mass(rho=1.0)
+        _tm  = self.skin_mesh.t_mass.to_numpy()
+        n_bt = self.n_left_tets + self.n_right_tets   # breast tet count
+        self._breast_tm_field.from_numpy(_tm[:n_bt])
+        self._skin_tm_field.from_numpy(_tm[n_bt:])
+        self.skin_mesh.set_fixed_point(0, self._pin_ti)
+
+        # init_rest_status and v_v.fill(0) are the caller's responsibility;
+        # rebuild_breasts() does both after this method returns.
+
+        print(f"[torso] rebuild_skin_shell done — "
+              f"{self.n_skin_verts} skin verts, "
+              f"{self.n_skin_tets} skin tets, "
+              f"{len(new_surf_outer)} outer faces")
+        return True
+
+    # ------------------------------------------------------------------
+    # Live breast mesh rebuild
+    # ------------------------------------------------------------------
+    def rebuild_breasts(self, **new_params) -> None:
+        """Rebuild the breast mesh with new shape parameters.
+
+        Accepted keyword arguments (any subset of):
+            breast_height, breast_radius, breast_k, breast_spread, breast_tilt,
+            target_tets
+
+        The deformation cage algorithm preserves the existing physics deformation
+        so the simulation continues smoothly from approximately the current state.
+        """
+        from PBD_Taichi.geom.deform_cage import morph_breast_mesh
+
+        # Merge new params over stored defaults (no randomisation for user control)
+        params = {**self._breast_build_params, **new_params}
+        self._breast_build_params = params   # remember for next rebuild
+
+        print(f"[torso] rebuild_breasts: "
+              f"h={params['breast_height']*1000:.0f}mm "
+              f"r={params['breast_radius']*1000:.0f}mm "
+              f"k={params['breast_k']:.2f} "
+              f"spread={params['breast_spread']:.2f} "
+              f"tilt={params['breast_tilt']:.2f}")
+
+        # ── Snapshot current state ────────────────────────────────────────
+        all_vp  = self.skin_mesh.v_p.to_numpy().astype(np.float32)
+        all_ref = self.skin_mesh.v_p_ref.to_numpy().astype(np.float32)
+        n_l = self.n_left_verts
+        n_r = self.n_right_verts
+
+        old_rest_l    = all_ref[:n_l]
+        old_curr_l    = all_vp[:n_l]
+        old_rest_r    = all_ref[n_l:n_l + n_r]
+        old_curr_r    = all_vp[n_l:n_l + n_r]
+
+        # ── Build new target meshes (no randomisation) ────────────────────
+        spread = float(params['breast_spread'])
+        v_l_new, _, _, _, _ = Breast.make_numpy(
+            spread=spread,
+            tilt=params['breast_tilt'],
+            radius=params['breast_radius'],
+            height=params['breast_height'],
+            k=params['breast_k'],
+            target_tets=int(params['target_tets']))
+        v_r_new, _, _, _, _ = Breast.make_numpy(
+            spread=-spread,
+            tilt=params['breast_tilt'],
+            radius=params['breast_radius'],
+            height=params['breast_height'],
+            k=params['breast_k'],
+            target_tets=int(params['target_tets']))
+
+        # ── Cage-based morph (keeps existing vert count + topology) ────────
+        new_rest_l, new_curr_l = morph_breast_mesh(old_rest_l, v_l_new, old_curr_l)
+        new_rest_r, new_curr_r = morph_breast_mesh(old_rest_r, v_r_new, old_curr_r)
+
+        # ── Update position fields in-place ───────────────────────────────
+        all_ref_new = all_ref.copy()
+        all_ref_new[:n_l]        = new_rest_l
+        all_ref_new[n_l:n_l+n_r] = new_rest_r
+
+        all_vp_new = all_vp.copy()
+        all_vp_new[:n_l]        = new_curr_l
+        all_vp_new[n_l:n_l+n_r] = new_curr_r
+
+        self.skin_mesh.v_p_ref.from_numpy(all_ref_new)
+        self.skin_mesh.v_p.from_numpy(all_vp_new)
+
+        # ── Recompute masses from new vertex positions ─────────────────────
+        self.skin_mesh.reset_mass(rho=1.0)
+
+        # Re-sync per-constraint tet-mass caches (sliced copies of t_mass)
+        _tm   = self.skin_mesh.t_mass.to_numpy()
+        n_bt  = self.n_left_tets + self.n_right_tets
+        self._breast_tm_field.from_numpy(_tm[:n_bt])
+        if self.n_skin_tets > 0:
+            self._skin_tm_field.from_numpy(_tm[n_bt:])
+
+        # Re-apply pins (reset_mass writes v_invm for ALL verts including base)
+        self.skin_mesh.set_fixed_point(0, self._pin_ti)
+
+        # ── Snap skin inner verts to their new barycentric targets ───────────────────
+        # After the breast morph, skin inner verts are still at their old positions.
+        # Teleporting them onto the new breast surface before init_rest_status()
+        # prevents large initial spring forces that can cause instability.
+        self._snap_skin_inner_verts()
+
+        # ── Rebuild the skin shell from the new breast geometry ───────────────────────
+        # This regenerates the skin-shell tet mesh and all barycentric bindings so
+        # the outer skin surface properly conforms to the new breast shape.
+        self.rebuild_skin_shell()
+
+        # ── Recompute constraint rest lengths ──────────────────────────────────────────
+        self.xpbd.init_rest_status()
+
+        # Zero ALL velocities to prevent sudden impulses from the teleport
+        self.xpbd.v_v.fill(0)
+
+        # ── Update stored breast surface face arrays ───────────────────────
+        # (topology unchanged — face arrays are still correct)
+        # Only apex world-pos used by nipple needs refreshing via callbacks.
+
+        # ── Invoke registered callbacks (e.g. nipple rebuild) ─────────────
+        for cb in self._breast_rebuild_callbacks:
+            try:
+                cb(self)
+            except Exception as _e:
+                print(f"[torso] rebuild callback error: {_e}")
+
+        print(f"[torso] rebuild_breasts done")
 
     # ------------------------------------------------------------------
     # Skin kinematic update – push fresh skeleton targets each frame
