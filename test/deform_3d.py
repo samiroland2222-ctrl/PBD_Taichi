@@ -13,30 +13,18 @@ from utils import renderer, breast_mesh_generator, parser
 from PBD_Taichi.cons.torso import SKIN_HYDRO_ALPHA, SKIN_DEVIA_ALPHA
 
 # ── Skin PBR texture support (wgpu backend only) ──────────────────────────────
-try:
-    from utils.skin_texture_gen import generate_skin_textures as _gen_skin_tex
-    _SKIN_TEX_AVAILABLE = True
-except ImportError:
-    _SKIN_TEX_AVAILABLE = False
+from utils.skin_texture_gen import generate_skin_textures as _gen_skin_tex
 
 # ── Nipple geometry support ───────────────────────────────────────────────────
-try:
-    from PBD_Taichi.geom.nipple import (
-        make_nipple_pair, eval_hires_positions,
-        set_firmness, refresh_hires,
-        _NIPPLE_H_FIRM, _NIPPLE_H_RELAX,
-        _NIPPLE_R_TIP_FIRM, _NIPPLE_R_TIP_RELAX, _NIPPLE_RADIUS,
-    )
-    _NIPPLE_AVAILABLE = True
-except ImportError:
-    _NIPPLE_AVAILABLE = False
+from PBD_Taichi.geom.nipple import (
+    make_nipple_pair, eval_hires_positions,
+    set_firmness, refresh_hires,
+    _NIPPLE_H_FIRM, _NIPPLE_H_RELAX,
+    _NIPPLE_R_TIP_FIRM, _NIPPLE_R_TIP_RELAX, _NIPPLE_RADIUS,
+)
 
 # ── Breathing animation ───────────────────────────────────────────────────────
-try:
-    from PBD_Taichi.utils.breathing import BreathingController, BreathingParams
-    _BREATHING_AVAILABLE = True
-except ImportError:
-    _BREATHING_AVAILABLE = False
+from PBD_Taichi.utils.breathing import BreathingController, BreathingParams
 
 ti.init(arch=ti.cpu, cpu_max_num_threads=1)
 
@@ -117,65 +105,62 @@ _nipple_l = _nipple_r = None
 _nipple_l_vp = _nipple_l_fi = None   # Taichi fields (set below if available)
 _nipple_r_vp = _nipple_r_fi = None
 
-if _NIPPLE_AVAILABLE:
-    try:
-        _ref_verts = torso.skin_mesh.v_p_ref.to_numpy()
-        _bl_v_rest = _ref_verts[:torso.n_left_verts].astype(np.float32)
-        _br_v_rest = _ref_verts[torso.n_left_verts:
-                                 torso.n_left_verts + torso.n_right_verts].astype(np.float32)
+try:
+    _ref_verts = torso.skin_mesh.v_p_ref.to_numpy()
+    _bl_v_rest = _ref_verts[:torso.n_left_verts].astype(np.float32)
+    _br_v_rest = _ref_verts[torso.n_left_verts:
+                             torso.n_left_verts + torso.n_right_verts].astype(np.float32)
 
-        # ── Skin outer-shell anchor mesh ────────────────────────────────────
-        # The nipple cage base vertices are bound to the extruded outer skin
-        # layer so they track the skin surface, not the underlying breast flesh.
-        _skin_outer_anchor_verts = None
-        _skin_outer_anchor_faces = None
-        if (torso._skin_outer_vert_offset is not None
-                and torso._skin_outer_faces_np is not None):
-            _skin_outer_n = torso.n_skin_verts - torso.n_skin_inner_verts
-            _skin_outer_start = torso._skin_outer_vert_offset
-            _skin_outer_anchor_verts = _ref_verts[
-                _skin_outer_start : _skin_outer_start + _skin_outer_n
-            ].astype(np.float32)
-            _skin_outer_anchor_faces = torso._skin_outer_faces_np
-            print(f"[nipple] skin outer anchor: {len(_skin_outer_anchor_verts)} verts, "
-                  f"{len(_skin_outer_anchor_faces)} faces")
+    # ── Skin outer-shell anchor mesh ────────────────────────────────────
+    # The nipple cage base vertices are bound to the extruded outer skin
+    # layer so they track the skin surface, not the underlying breast flesh.
+    _skin_outer_anchor_verts = None
+    _skin_outer_anchor_faces = None
+    if (torso._skin_outer_vert_offset is not None
+            and torso._skin_outer_faces_np is not None):
+        _skin_outer_n = torso.n_skin_verts - torso.n_skin_inner_verts
+        _skin_outer_start = torso._skin_outer_vert_offset
+        _skin_outer_anchor_verts = _ref_verts[
+            _skin_outer_start : _skin_outer_start + _skin_outer_n
+        ].astype(np.float32)
+        _skin_outer_anchor_faces = torso._skin_outer_faces_np
+        print(f"[nipple] skin outer anchor: {len(_skin_outer_anchor_verts)} verts, "
+              f"{len(_skin_outer_anchor_faces)} faces")
 
-        _nipple_l, _nipple_r = make_nipple_pair(
-            _bl_v_rest, torso._breast_l_faces_np,
-            _br_v_rest, torso._breast_r_faces_np,
-            base_l_vertex_indices=torso._breast_l_base_local_np,
-            base_r_vertex_indices=torso._breast_r_base_local_np,
-            anchor_verts=_skin_outer_anchor_verts,
-            anchor_faces=_skin_outer_anchor_faces,
-            n_sides=4, hires_segs=16, hires_rings=7,
-        )
-        # Create Taichi fields for the hi-res vertices (updated each frame)
-        _nipple_l_vp = ti.Vector.field(3, dtype=ti.f32, shape=len(_nipple_l.hires_verts))
-        _nipple_r_vp = ti.Vector.field(3, dtype=ti.f32, shape=len(_nipple_r.hires_verts))
-        _nipple_l_vp.from_numpy(_nipple_l.hires_verts)
-        _nipple_r_vp.from_numpy(_nipple_r.hires_verts)
-        # Taichi fields for static face indices
-        _nl_fi_np = _nipple_l.hires_faces.flatten().astype(np.int32)
-        _nr_fi_np = _nipple_r.hires_faces.flatten().astype(np.int32)
-        _nipple_l_fi = ti.field(dtype=ti.i32, shape=len(_nl_fi_np))
-        _nipple_r_fi = ti.field(dtype=ti.i32, shape=len(_nr_fi_np))
-        _nipple_l_fi.from_numpy(_nl_fi_np)
-        _nipple_r_fi.from_numpy(_nr_fi_np)
-        print(f"[nipple] built: L={len(_nipple_l.hires_verts)} verts "
-              f"{len(_nipple_l.hires_faces)} tris | "
-              f"R={len(_nipple_r.hires_verts)} verts "
-              f"{len(_nipple_r.hires_faces)} tris")
-    except Exception as _e:
-        print(f"[nipple] WARNING: failed to build nipple geometry: {_e}")
-        import traceback; traceback.print_exc()
-        _nipple_l = _nipple_r = None
+    _nipple_l, _nipple_r = make_nipple_pair(
+        _bl_v_rest, torso._breast_l_faces_np,
+        _br_v_rest, torso._breast_r_faces_np,
+        base_l_vertex_indices=torso._breast_l_base_local_np,
+        base_r_vertex_indices=torso._breast_r_base_local_np,
+        anchor_verts=_skin_outer_anchor_verts,
+        anchor_faces=_skin_outer_anchor_faces,
+        n_sides=4, hires_segs=16, hires_rings=7,
+    )
+    # Create Taichi fields for the hi-res vertices (updated each frame)
+    _nipple_l_vp = ti.Vector.field(3, dtype=ti.f32, shape=len(_nipple_l.hires_verts))
+    _nipple_r_vp = ti.Vector.field(3, dtype=ti.f32, shape=len(_nipple_r.hires_verts))
+    _nipple_l_vp.from_numpy(_nipple_l.hires_verts)
+    _nipple_r_vp.from_numpy(_nipple_r.hires_verts)
+    # Taichi fields for static face indices
+    _nl_fi_np = _nipple_l.hires_faces.flatten().astype(np.int32)
+    _nr_fi_np = _nipple_r.hires_faces.flatten().astype(np.int32)
+    _nipple_l_fi = ti.field(dtype=ti.i32, shape=len(_nl_fi_np))
+    _nipple_r_fi = ti.field(dtype=ti.i32, shape=len(_nr_fi_np))
+    _nipple_l_fi.from_numpy(_nl_fi_np)
+    _nipple_r_fi.from_numpy(_nr_fi_np)
+    print(f"[nipple] built: L={len(_nipple_l.hires_verts)} verts "
+          f"{len(_nipple_l.hires_faces)} tris | "
+          f"R={len(_nipple_r.hires_verts)} verts "
+          f"{len(_nipple_r.hires_faces)} tris")
+except Exception as _e:
+    print(f"[nipple] WARNING: failed to build nipple geometry: {_e}")
+    import traceback; traceback.print_exc()
+    _nipple_l = _nipple_r = None
 
 # ── Nipple rebuild helper (called after breast reshape) ───────────────────────
 def _rebuild_nipples_from_torso(torso_inst=None):
     """Rebuild nipple geometry from the current (post-rebuild) breast mesh."""
     global _nipple_l, _nipple_r, _nipple_l_vp, _nipple_r_vp, _nipple_l_fi, _nipple_r_fi
-    if not _NIPPLE_AVAILABLE:
-        return
     try:
         _ref = torso.skin_mesh.v_p_ref.to_numpy()
         _bl = _ref[:torso.n_left_verts].astype(np.float32)
@@ -233,7 +218,7 @@ _skin_params = {
 
 def _build_skin_textures(seed: int):
     """Generate (or regenerate) skin PBR textures from the current skin mesh."""
-    if not (_SKIN_TEX_AVAILABLE and _wgpu and torso.skin_f_i is not None):
+    if not (_wgpu and torso.skin_f_i is not None):
         return None
     verts_np = torso.skin_mesh.v_p.to_numpy()
     faces_np = torso.skin_f_i.to_numpy().reshape(-1, 3)
@@ -310,14 +295,13 @@ tirender.add_scene_render_draw(ribcage_mesh.get_render_draw(color=(0.7, 0.7, 0.5
 
 # ── Breathing animation ───────────────────────────────────────────────────────
 _breath_ctrl = None
-if _BREATHING_AVAILABLE:
-    _breath_ctrl = BreathingController(BreathingParams(
-        rate_bpm=15.0,
-        chest_amplitude=0.008,
-        abdomen_amplitude=0.012,
-    ))
-    _breath_ctrl.snapshot_ribcage_rest(skel)
-    print("[breathing] controller ready")
+_breath_ctrl = BreathingController(BreathingParams(
+    rate_bpm=15.0,
+    chest_amplitude=0.008,
+    abdomen_amplitude=0.012,
+))
+_breath_ctrl.snapshot_ribcage_rest(skel)
+print("[breathing] controller ready")
 
 if _wgpu and _skin_tex is not None:
     # PBR skin draw: replaces the flat-color all-faces draw when PBR is active.
@@ -575,7 +559,7 @@ def gui_draw_debug(gui):
 tirender.add_gui_draw(gui_draw_debug)
 
 # ── Keybind: T → regenerate skin textures with new seed ──────────────────────
-if _wgpu and _SKIN_TEX_AVAILABLE:
+if _wgpu:
     def _regen_skin_textures():
         global _skin_tex
         _skin_tex_seed[0] = random.randint(0, 9999)
